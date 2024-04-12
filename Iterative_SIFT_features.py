@@ -1,0 +1,2462 @@
+# A work-around to the bug in the official Torch library has been found, 
+# The TORCH.NN.FUNCTIONAL.AFFINE_GRID does not transform the image correctly.
+# This fix is here
+# https://colab.research.google.com/drive/1JC8lJFFEQVLxWfcfUcSsiDU7DYkdAn-D
+
+
+## conda activate dinov2
+# cp -r '/home/ahmadh/imagenet-object-localization-challenge/ILSVRC/Data/Standard_Size/224/' '../../tmp/224/'
+# cp -r '/home/ahmadh/imagenet-object-localization-challenge/ILSVRC/Data/Standard_Size/augmented/' '../../localdb/augmented/'
+# cp -r '/home/ahmadh/imagenet-object-localization-challenge/ILSVRC/Data/Standard_Size/224/' '../../localdb/224/'
+
+#Delete AE option if results are not beter than U-Net. The only difference between them is the shape of input: [3,2x128,128] Vs [2x3,128,128]
+
+# imports
+import os, sys
+import numpy as np
+from PIL import Image
+import itertools
+import glob
+import random
+import time
+import json
+import torch
+import torchvision
+import torchvision.transforms as transforms
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.nn.functional import relu as RLU
+import torch.multiprocessing as mp
+from torchvision.models import resnet18
+
+import matplotlib.pyplot as plt
+import tqdm
+
+import cv2
+
+#-------------------------------------------------------------
+device_num=2
+
+registration_method = 'Additive_Recurence'#'SIFT'#'Additive_Recurence' #{'Rawblock', 'matching_points', 'Additive_Recurence', 'Multiplicative_Recurence'} #'recurrent_matrix', 
+dim = 128
+ease=1
+
+if 'SIFT' in registration_method:
+    dim0 =dim
+    device = 'cpu'
+    Arch = 'SIFT_RANSAC'
+else:
+    dim0 =224
+    torch.cuda.set_device(device_num)
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    Arch = 'ResNet'#{'VTX', 'U-Net','ResNet', 'DINO' , }
+
+crop_ratio = dim/dim0
+
+if dim0!= 224:
+    DATASET_generation_split = { 'train': 'active',
+    'val': 'active',
+    'test': 'active',
+    'test0':'active'}
+else:
+    DATASET_generation_split = { 'train': 'active',
+        'val': 'passive',
+        'test': 'passive',
+        'test0':'active'}
+
+DATASET_generation = DATASET_generation_split['train']#'active' #{'passive', #'active'}
+
+imposed_point = 0
+
+
+Glopooling = 'Bastien'#'max', 'avg', 'none','Bastien'
+IMG_noise = False
+LYR_NORM = False
+Fix_Torch_Wrap = False
+BW_Position = False
+
+if Fix_Torch_Wrap:
+    Noise_level_dataset = 0.1*ease
+else:
+    Noise_level_dataset = 0.5*ease
+
+folder_suffix = ''
+
+if BW_Position:
+    folder_suffix += '.BWPosition'
+
+
+if IMG_noise:
+    IMG_noise_level = 0.1*ease
+    folder_suffix += 'ImgNoise{}_'.format(IMG_noise_level)
+else:
+    IMG_noise_level= 0
+
+if 'Recurence' in registration_method :
+    folder_suffix += '.completely_random'#'random_aff_param'#'completely_random' #'scheduledrandom' #zero
+
+if registration_method == 'matching_points':
+    with_epch_loss = True
+    if imposed_point>0:
+        folder_suffix += str(imposed_point)
+else:
+    with_epch_loss = False
+
+if Fix_Torch_Wrap:
+    folder_suffix += 'AdustMtrx_'
+else:
+    folder_suffix += 'Adjustplot_'
+
+folder_suffix+= Glopooling+'Pool_'
+
+
+if LYR_NORM:
+    folder_suffix += 'LyrNORM_'
+
+with_shear = True
+if with_shear:
+    Intitial_Tx = ['angle', 'scale', 'translationX','translationY','shearX','shearY'] #,{'shearX','shearY'}
+else:
+    Intitial_Tx = ['angle', 'scale', 'translationX','translationY'] #,'shearX','shearY'] #,{'shearX','shearY'}
+
+if Arch == 'VTX':
+    batch_size = 16
+elif Arch == 'ResNet':
+    batch_size = 30
+    if 'Recurence' in registration_method:
+        batch_size = 80
+elif Arch == 'U-Net':
+    batch_size = 30
+elif Arch == 'DINO':
+    batch_size = 30
+
+if registration_method=='matching_points':
+    N_parameters = 18
+else:
+    N_parameters = 6
+
+
+
+
+activedata_root = '../../localdb/224/'
+saveddata_root = root = '../../localdb/augmented/'
+#'/home/ahmadh/imagenet-object-localization-challenge/ILSVRC/Data/Standard_Size/augmented/'
+#root = activedata_root
+routes_source={}
+for x in ['train', 'val', 'test','test0']:
+    if DATASET_generation_split[x] == 'active':
+        if x=='test0':
+            if DATASET_generation_split[x]==DATASET_generation_split['test']:
+                routes_source[x] = routes_source['test']
+            else:
+                routes_source[x] = glob.glob(activedata_root+'test'+"/**/*.JPEG", recursive = True)
+        else:
+            routes_source[x] = glob.glob(activedata_root+x+"/**/*.JPEG", recursive = True)
+    else:
+        routes_source[x] = glob.glob(saveddata_root+x+'/source'+str(Noise_level_dataset)+"**/*.JPEG", recursive = True)
+
+file_savingfolder = '/home/ahmadh/MIR_savedmodel/{}_Mi0:{}_{}_{}_{}/'.format(
+            registration_method,folder_suffix, Arch, DATASET_generation,Noise_level_dataset)
+#file_savingfolder = file_savingfolder[:-1] +'shuffle_trainloader/' 
+os.system('mkdir '+ file_savingfolder)
+os.system('mkdir '+ file_savingfolder+ 'MIRexamples')
+
+#val_routes = random.sample(val_routes, 20000)
+
+'''
+if DATASET_generation == 'active':
+    root = activedata_root
+    #root = '/home/ahmadh/imagenet-object-localization-challenge/ILSVRC/Data/Standard_Size/224/'
+    train_routes_source = glob.glob(root+'train/'+"**/*.JPEG", recursive = True)
+    val_routes_source = glob.glob(root+'val/'+"**/*.JPEG", recursive = True)
+    test_routes_source = glob.glob(root+'test/'+"**/*.JPEG", recursive = True)
+else:
+    #root = '../../localdb/augmented/'
+    root = saveddata_root
+    train_routes_source = glob.glob(root+'train/'+'source'+str(Noise_level_dataset)+"**/*.JPEG", recursive = True)
+    val_routes_source = glob.glob(root+'val/'+'source'+str(Noise_level_dataset)+"**/*.JPEG", recursive = True)
+    #test_routes_source = glob.glob(root+'test/'+'source'+str(Noise_level_dataset)+"**/*.JPEG", recursive = True)
+'''
+
+
+
+#---------------Data--------------------------------
+#---------------------------------------------------
+#---------------------------------------------------
+# Note when the input is in the form of dictionary, parallalism fails
+
+
+class Identity(nn.Module):
+    def __init__(self):
+        super(Identity, self).__init__()
+    def forward(self, x):
+        return x
+
+def wrap_imge_with_inverse(Affine_mtrx, source_img, ratio= 2):
+    #edited version on 20240301
+    Affine_mtrx = workaround_matrix(Affine_mtrx, acc = ratio).to('cpu')
+    grd = torch.nn.functional.affine_grid(Affine_mtrx, size=source_img.shape,align_corners=False)
+    wrapped_img = torch.nn.functional.grid_sample(source_img, grid=grd,
+                                                  mode='bilinear', padding_mode='zeros', align_corners=False)
+    return wrapped_img
+
+def wrap_imge0(Affine_mtrx, source_img):
+    grd = torch.nn.functional.affine_grid(Affine_mtrx, size=source_img.shape,align_corners=False)
+    wrapped_img = torch.nn.functional.grid_sample(source_img.to(device), grid=grd.to(device),
+                                                  mode='bilinear', padding_mode='zeros', align_corners=False)
+    return wrapped_img
+
+def wrap_imge_cropped(Affine_mtrx, source_img, dim1=224, dim2=128):
+  source_img224 = torch.nn.ZeroPad2d(int((dim1-dim2)/2))(source_img)
+  grd = torch.nn.functional.affine_grid(Affine_mtrx, size=source_img224.shape,align_corners=False)
+  wrapped_img = torch.nn.functional.grid_sample(source_img224, grid=grd,
+                                                mode='bilinear', padding_mode='zeros', align_corners=False)
+  wrapped_img = torchvision.transforms.CenterCrop((dim2, dim2))(wrapped_img)
+  return wrapped_img
+
+
+def workaround_matrix(Affine_mtrx0, acc = 2):
+    # To find the equivalent torch-compatible matrix from a correct matrix set acc=2 #This will be needed for transforming an image
+    # To find the correct Affine matrix from Torch compatible matrix set acc=0.5
+    Affine_mtrx_adj = inv_AM(Affine_mtrx0)
+    Affine_mtrx_adj[:,:,2]*=acc
+    return Affine_mtrx_adj
+
+def inv_AM(Affine_mtrx):
+    AM3 = mtrx3(Affine_mtrx)
+    AM_inv = torch.linalg.inv(AM3)
+    return AM_inv[:,0:2,:]
+
+def mtrx3(Affine_mtrx):
+    mtrx_shape = Affine_mtrx.shape
+    if len(mtrx_shape)==3:
+        N_Mbatches = mtrx_shape[0]
+        AM3 = torch.zeros( [N_Mbatches,3,3]).to(device)
+        AM3[:,0:2,:] = Affine_mtrx
+        AM3[:,2,2] = 1
+    elif len(mtrx_shape)==2:
+        N_Mbatches = 1
+        AM3 = torch.zeros([3,3]).to(device)
+        AM3[0:2,:] = Affine_mtrx
+        AM3[2,2] = 1 
+    return AM3
+
+def move_dict2device(dictionary,device):
+    for key in list(dictionary.keys()):
+        dictionary[key] = dictionary[key].to(device)
+    return dictionary
+
+def standarize_point(d, dim=128, flip = False):
+    if flip:
+        d = -d
+    return d/dim - 0.5
+
+def destandarize_point(d, dim=128, flip = False):
+    if flip:
+        d = -d
+    return dim*(d + 0.5)
+
+def generate_standard_elips(N_samples = 100, a= 1,b = 1, with_direction=False):
+    radius = 0.25
+    center = 0
+    N_samples1 = int(N_samples/2 - 1)
+    N_samples2 = N_samples - N_samples1
+    x1 = torch.distributions.uniform.Uniform(center-radius,center + radius).sample([N_samples1])
+    x1_ordered = torch.sort(x1).values
+    y1 = center + b*torch.sqrt(radius**2 - ((x1_ordered-center)/a)**2)
+    x2 = torch.distributions.uniform.Uniform(center-radius,center + radius).sample([N_samples2])
+    x2_ordered = torch.sort(x2, descending=True).values
+    y2 = center - b*torch.sqrt(radius**2 - ((x2_ordered-center)/a)**2)
+    if with_direction:
+        x_direction = torch.tensor([center]*5)
+        y_direction = torch.tensor([radius-0.02, radius-0.06, radius-0.010, radius-0.05,radius-0.01])
+        x = torch.cat([x1_ordered,x_direction, x2_ordered])
+        y = torch.cat([y1, y_direction, y2])       
+    else:
+        x = torch.cat([x1_ordered, x2_ordered])
+        y = torch.cat([y1, y2])
+    return x, y
+
+def transform_standard_points(Affine_mat, x,y):
+    XY = torch.ones([3,x.shape[0]])
+    XY[0,:]= x
+    XY[1,:]= y
+    XYt = torch.matmul(Affine_mat.to('cpu').detach(),XY)
+    xt0 = XYt[0]
+    yt0 = XYt[1]
+    return xt0, yt0
+
+
+def save_examples(model, loader , n_examples = 4, plt_elipses=True,plt_imgs=False, time=1):
+    #prepare figures
+    figure = plt.figure()
+    gs = figure.add_gridspec(n_examples, 3, hspace=0.05, wspace=0)
+    axis = gs.subplots(sharex='col', sharey='row')
+    figure.set_figheight(5*n_examples)
+    figure.set_figwidth(15)
+    with torch.no_grad():
+        dataiter = iter(loader)
+        for k in range(n_examples):
+            for select in range(time):
+                X_batch, Y_batch = next(dataiter)
+            X_batch = move_dict2device(X_batch,device)
+            Y_batch = move_dict2device(Y_batch,device)
+            pred = model(X_batch)
+            Affine_mtrx = pred['Affine_mtrx']
+            source = X_batch['source'].to(device)
+            target = X_batch['target'].to(device)
+            if Fix_Torch_Wrap:
+                wrapped_img = wrap_imge0(Affine_mtrx, source)
+                M_GroundTruth = workaround_matrix(Y_batch['Affine_mtrx'].detach(), acc = 0.5)
+                M_Predicted = workaround_matrix(pred['Affine_mtrx'].detach(), acc = 0.5)
+            else:
+                wrapped_img = wrap_imge_cropped(Affine_mtrx, source)
+                M_GroundTruth = workaround_matrix(Y_batch['Affine_mtrx'].detach(), acc = 0.5/crop_ratio)
+                M_Predicted = workaround_matrix(pred['Affine_mtrx'].detach(), acc = 0.5/crop_ratio)
+            if plt_elipses:
+                x0_source, y0_source = generate_standard_elips(N_samples = 100)
+                x0_target, y0_target = transform_standard_points(M_GroundTruth[k], x0_source, y0_source)
+                x0_transformed, y0_transformed = transform_standard_points(M_Predicted[k], x0_source, y0_source)
+                #x0_target, y0_target = transform_standard_points(Y_batch['Affine_mtrx'][k], x0_source, y0_source)
+                #x0_transformed, y0_transformed = transform_standard_points(pred['Affine_mtrx'][k], x0_source, y0_source)
+                #--------------destandarize for plotting purposes-------------
+                x_source = destandarize_point(x0_source, dim=dim, flip = False)
+                x_target = destandarize_point(x0_target, dim=dim, flip = False)
+                x_transformed = destandarize_point(x0_transformed, dim=dim, flip = False)
+                #flip the y-axis because when plotting the y axis is downward instead of upward
+                y_source = destandarize_point(y0_source, dim=dim, flip = False)
+                y_target = destandarize_point(y0_target, dim=dim, flip = False)
+                y_transformed = destandarize_point(y0_transformed, dim=dim, flip = False)
+                #plot
+                axis[k, 0].plot(x_source,y_source, color ='black',marker='x', linewidth = 2)
+                axis[k, 1].plot(x_target,y_target, color ='black',marker='x', linewidth = 2)
+                axis[k, 2].plot(x_target,y_target, color ='black',marker='', linewidth = 2)
+                axis[k, 2].plot(x_transformed,y_transformed, color ='red',marker='x', linewidth = 2)
+            if plt_imgs:
+                axis[k, 0].imshow(torchvision.transforms.ToPILImage()(source[k]))
+                axis[k, 1].imshow(torchvision.transforms.ToPILImage()(target[k]))
+                axis[k, 2].imshow(torchvision.transforms.ToPILImage()(wrapped_img[k]))
+                
+        for ax in figure.get_axes():
+            ax.label_outer()
+            ax.axes.get_xaxis().set_visible(False)
+            ax.axes.get_yaxis().set_visible(False)
+            
+        suffix = ''
+        if plt_elipses:
+                suffix += 'Elipse'
+        if plt_imgs:
+                suffix += 'Img'
+        plt.savefig(file_savingfolder+'MIRexamples/{}_{}.jpeg'.format(suffix,time), bbox_inches='tight')
+        plt.close()
+
+
+def save_n_examples(model, loader,n_times=2, n_examples_per_time = 4 ):
+    for m in range(n_times):
+        save_examples(model, loader, n_examples = n_examples_per_time, plt_elipses=True, plt_imgs=False, time =m)
+        save_examples(model, loader, n_examples = n_examples_per_time, plt_elipses=False, plt_imgs=True, time =m)
+        save_examples(model, loader, n_examples = n_examples_per_time, plt_elipses=True, plt_imgs=True, time =m)
+
+#save_n_examples(IR_Model_tst, testloader, n_times=2, n_examples_per_time = 4)
+
+def pil_to_numpy(im):
+    im.load()
+    # Unpack data
+    e = Image._getencoder(im.mode, "raw", im.mode)
+    e.setimage(im.im)
+    # NumPy buffer for the result
+    shape, typestr = Image._conv_type_shape(im)
+    data = np.empty(shape, dtype=np.dtype(typestr))
+    mem = data.data.cast("B", (data.data.nbytes,))
+    bufsize, s, offset = 65536, 0, 0
+    while not s:
+        l, s, d = e.encode(bufsize)
+        mem[offset:offset + len(d)] = d
+        offset += len(d)
+    if s < 0:
+        raise RuntimeError("encoder error %d in tobytes" % s)
+    return data
+
+def load_image_pil_accelerated(image_path, dim0 = 224):
+    image = Image.open(image_path).convert("RGB")
+    array = pil_to_numpy(image)
+    tensor = torch.from_numpy(np.rollaxis(array,2,0)/255).to(torch.float32)
+    tensor = torchvision.transforms.Resize((dim0,dim0))(tensor)
+    return tensor.to(torch.float32)
+
+#---------------------------------------------------
+#---------------------------------------------------
+
+def Load_augment(image_path, dim = 128, dim0=224): #measures=['angle', 'scale', 'translationX','translationY','shearX','shearY'], Noise_level=0,
+  #enlargement = crop_ratio
+  Outputs= {}
+  #image0 = load_image_from_url(image_path, int(enlargement*dim))
+  #image0 = (transforms.ToTensor()(image0)).unsqueeze(0).to(torch.float32)
+ 
+  image0 = load_image_pil_accelerated(image_path, dim0).unsqueeze(0)
+  transformed_img, Affine_mtrx, Affine_parameters = augment_img(image0)#, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx)
+  image1 = torchvision.transforms.CenterCrop((dim, dim))(image0)
+  transformed_img = torchvision.transforms.CenterCrop((dim, dim))(transformed_img)
+  Outputs['Affine_mtrx'] = Affine_mtrx[0]
+  Outputs['source'] = image1[0]
+  Outputs['target'] = transformed_img[0]
+  Outputs['Affine_parameters'] = Affine_parameters[0]
+  return Outputs
+
+def load_image_from_url(url, dim = 128):
+    #if url.startswith('http'):
+    #  url = urllib.request.urlopen(url)
+    img = Image.open(url).convert("RGB")
+    if dim!=224:
+        img = img.resize((dim, dim))
+    return img
+
+
+#This function is created to pass Noise and the transformations which will be used to generate the affine matrix.
+# THose parameters are not determined in the dataset class, so that they can be changed actively during training
+#---------------------------------------------------
+# Later another function(pass_parameters) should be defined to handle this instead, where when it is called it returns those changing parmeters: Noise, transformations, schedulers 
+#---------------------------------------------------
+#---------------------------------------------------
+def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx): #,'shearX','shearY'
+    wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL)
+    return wrapped_img, Affine_mtrx, Affine_parameters
+
+def pass_augment_img(image0, measure,NOISE_LEVEL=0, MODE='nearest'):
+    try:
+        dimw = image0.width
+        dimh = image0.height
+    except:
+        dimw = image0.shape[2]
+        dimh = image0.shape[3]
+    #if no augmentation
+    angle = 0
+    scale_inv = (1 - 0.4)/1.3
+    translationx = 0.5
+    translationy = 0.5
+    shearX=0
+    shearY=0
+    # if augmentation
+    if 'angle' in measure: angle = np.random.uniform(0, 1) #1 is equivalent to 360 degrees or 2pi = 6.29
+    if 'scale' in measure: scale_inv = np.random.uniform(0, 1)
+    if 'translationX' in measure: translationx = np.random.uniform(0, 1)
+    if 'translationY' in measure: translationy = np.random.uniform(0, 1)
+    if 'shearX' in measure: shearX = np.random.uniform(0, 1)
+    if 'shearY' in measure: shearY = np.random.uniform(0, 1)
+    Affine_parameters = torch.tensor([[angle, scale_inv,translationx,translationy, shearX,shearY]]).to(torch.float32)
+    Affine_mtrx = normalizedparameterline2Affine_matrx(Affine_parameters, device='cpu', Noise_level=NOISE_LEVEL)
+    if Fix_Torch_Wrap:
+        wrapped_img = wrap_imge_with_inverse(Affine_mtrx.detach(), image0, ratio= 2*crop_ratio)
+        Affine_mtrx = workaround_matrix(Affine_mtrx.detach(), acc = 2).detach()
+    else:
+        wrapped_img = wrap_imge0(Affine_mtrx, image0)
+    return wrapped_img, Affine_mtrx, Affine_parameters
+
+
+#Later this function should be used in "pass_augment_img"
+def Generate_random_AffineMatrix(measure=Intitial_Tx, NOISE_LEVEL=0, device='cpu'):
+    angle = 0
+    scale_inv = (1 - 0.4)/1.3
+    translationx = 0.5
+    translationy = 0.5
+    shearX=0
+    shearY=0
+    # if augmentation
+    if 'angle' in measure: angle = np.random.uniform(0, 1) #1 is equivalent to 360 degrees or 2pi = 6.29
+    if 'scale' in measure: scale_inv = np.random.uniform(0, 1)
+    if 'translationX' in measure: translationx = np.random.uniform(0, 1)
+    if 'translationY' in measure: translationy = np.random.uniform(0, 1)
+    if 'shearX' in measure: shearX = np.random.uniform(0, 1)
+    if 'shearY' in measure: shearY = np.random.uniform(0, 1)
+    Affine_parameters = torch.tensor([[angle, scale_inv,translationx,translationy, shearX,shearY]]).to(torch.float32)
+    Affine_mtrx = normalizedparameterline2Affine_matrx(Affine_parameters, device=device, Noise_level=NOISE_LEVEL)
+    return Affine_mtrx, Affine_parameters
+
+
+def normalizedparameterline2Affine_matrx(line, device, Noise_level=0.0):
+  N_batches = int(line.shape[0])
+  Affine_mtrx = torch.ones(N_batches, 2,3).to(device)
+  DeNormalize_parametersline = DeNormalize_AffineParameters(line)
+  for i in range(N_batches):
+    angle = DeNormalize_parametersline[i:i+1,0:1]
+    scale_inv = DeNormalize_parametersline[i:i+1,1:2]
+    translationx = DeNormalize_parametersline[i:i+1,2:3]
+    translationy = DeNormalize_parametersline[i:i+1,3:4]
+    shearx = DeNormalize_parametersline[i:i+1,4:5]
+    sheary = DeNormalize_parametersline[i:i+1,5:6]
+    Affine_Mtrx_i = Affine_parameters2matrx(angle,scale_inv,translationx,translationy, shearx, sheary)
+    Affine_mtrx[i,:] = Affine_Mtrx_i#[:2,:]#.reshape(1,2,3)
+  Affine_mtrx = Affine_mtrx+ Affine_mtrx*torch.normal(torch.zeros([N_batches,2,3]), Noise_level*torch.ones([N_batches,2,3]))
+  return Affine_mtrx.to(torch.float32)
+
+def Normalize_AffineParameters(parameters):
+   Norm_parameters = parameters.clone()
+   Norm_parameters[:,0]/= 6.29
+   Norm_parameters[:,1] = (Norm_parameters[:,1] - 0.4)/1.3
+   Norm_parameters[:,2] = (Norm_parameters[:,2] + 0.2)/0.4
+   Norm_parameters[:,3] = (Norm_parameters[:,3] + 0.2)/0.4
+   Norm_parameters[:,4] = (Norm_parameters[:,4] + 0.0)/0.1
+   Norm_parameters[:,5] = (Norm_parameters[:,5] + 0.0)/0.1
+   return Norm_parameters
+
+def DeNormalize_AffineParameters(Normalized_Parameters):
+   DeNormalized_Parameters = Normalized_Parameters.clone()
+   DeNormalized_Parameters[:,0]*= 6.29
+   DeNormalized_Parameters[:,1] = 1.3*DeNormalized_Parameters[:,1] + 0.4
+   DeNormalized_Parameters[:,2] = 0.4*DeNormalized_Parameters[:,2] - 0.2
+   DeNormalized_Parameters[:,3] = 0.4*DeNormalized_Parameters[:,3] - 0.2
+   DeNormalized_Parameters[:,4] = 0.1*DeNormalized_Parameters[:,4] - 0.0
+   DeNormalized_Parameters[:,5] = 0.1*DeNormalized_Parameters[:,5] - 0.0
+   return DeNormalized_Parameters
+
+def Affine_parameters2matrx(angle,scale_inv,translationx,translationy, shearx, sheary):
+   N_batches = 1#int(line.shape[0])
+   Affine_mtrx = torch.ones(N_batches, 2,3).to(device)
+   for i in range(N_batches):
+       Mat_shear = torch.tensor([[1.0, shearx, 0.0],[sheary,1.0, 0.0],[0.0, 0.0, 1.0]])
+       Mat_translation = torch.tensor([[1.0, 0.0, translationx],[0.0, 1.0, translationy],[0.0, 0.0, 1.0]])
+       Mat_scale = torch.tensor([[scale_inv, 0.0, 0.0],[0.0, scale_inv, 0.0],[0.0, 0.0, 1.0]])
+       Mat_Rot = torch.tensor([[torch.cos(angle), torch.sin(angle), 0.0],
+                               [-torch.sin(angle), torch.cos(angle), 0.0],
+                               [0.0, 0.0, 1.0]]).float()
+       Affine_Mtrx_i = torch.matmul(torch.matmul(torch.matmul(Mat_shear,Mat_scale), Mat_Rot),Mat_translation)
+       Affine_mtrx[i,:] = Affine_Mtrx_i[:2,:].reshape(1,2,3)
+   return Affine_mtrx
+
+def Affine_mtrx2parameters(Affine_Mtrx):
+   eps = 0.0000001
+   alpha = X_delta(Affine_Mtrx[:,1,0]+Affine_Mtrx[:,0,1])
+   N_batches = Affine_Mtrx.shape[0]
+   parameters = torch.zeros(N_batches, 6).to(device)
+   Translation_ = torch.matmul(torch.inverse(Affine_Mtrx[:,:2,:2]),Affine_Mtrx[:,:2,2:])
+   tan_theta = (1-alpha)*(Affine_Mtrx[:,1,1]-Affine_Mtrx[:,0,0])/(eps +Affine_Mtrx[:,1,0]+Affine_Mtrx[:,0,1]) + alpha*(Affine_Mtrx[:,0,1]/Affine_Mtrx[:,0,0])
+   Mx = (Affine_Mtrx[:,0,1]-Affine_Mtrx[:,0,0]*tan_theta)/(Affine_Mtrx[:,0,1]*tan_theta +Affine_Mtrx[:,0,0])
+   My = (Affine_Mtrx[:,1,0]+Affine_Mtrx[:,1,1]*tan_theta)/(Affine_Mtrx[:,1,1]- Affine_Mtrx[:,1,0]*tan_theta)
+   scale = torch.abs((Affine_Mtrx[:,0,0]+Affine_Mtrx[:,0,1]*tan_theta)/torch.sqrt(1+tan_theta**2))
+   sin_theta = (Affine_Mtrx[:,0,1]-Affine_Mtrx[:,0,0]*Mx)/(scale*(1+Mx**2))#torch.tensor(1) #the sign of sin(a) to be derived
+   parameters[:,1] = scale
+   parameters[:,0] = torch.atan(tan_theta)+ torch.pi*RLU(-(torch.sign(tan_theta)))+ torch.pi*RLU(-(torch.sign(sin_theta)))
+   parameters[:,2] = Translation_[:,0,0]
+   parameters[:,3] = Translation_[:,1,0]
+   parameters[:,4] = Mx
+   parameters[:,5] = My
+   Normalized_Parameters = Normalize_AffineParameters(parameters)
+   return Normalized_Parameters
+
+def X_delta(x):
+ return torch.exp(torch.tensor(-100000*x**2))
+
+def To_BWposition(img, dim):
+    Pos_x = np.cos(np.pi*(np.arange(0,dim)/dim - 1/2))
+    Pos_y = np.sin(np.pi*(np.arange(0,dim)/dim - 1/2))
+    Grey_img = torchvision.transforms.Grayscale()(img)
+    Position = torch.tensor(np.array([np.tile(Pos_x,[dim,1]).transpose(), np.tile(Pos_y,[dim,1])])).to(torch.float32)
+    BWposition = torch.cat([Grey_img,Position], dim=0)
+    return BWposition
+
+def batch_ToBWposition(img_batch):
+    dim = img_batch.shape[2]
+    Pos_x = np.cos(np.pi*(np.arange(0,dim)/dim - 1/2))
+    Pos_y = np.sin(np.pi*(np.arange(0,dim)/dim - 1/2))
+    BWposition_batch = img_batch.detach()
+    BWposition_batch[:,1:2,:,:] = torchvision.transforms.Grayscale()(img_batch)
+    BWposition_batch[:,1,:,:] = torch.from_numpy(np.tile(Pos_x,[dim,1]).transpose())
+    BWposition_batch[:,0,:,:] = torch.from_numpy(np.tile(Pos_y,[dim,1]))
+    return BWposition_batch
+
+
+def add_noise2img(img0, sigma = 0.1):
+    img0 = img0.detach().to('cpu')
+    s1 = sigma*torch.rand(1)#.to(device)
+    if torch.rand(1)>0.5:
+        gamma = 0.2+0.8*torch.rand(1)+0.1#.to(device)
+    else:
+        gamma = 1+4*torch.rand(1)#.to(device)
+    c = torch.normal(torch.zeros_like(img0), s1*torch.ones_like(img0))
+    img0_clipped = torch.clip(img0*(1 + c),0,1)
+    img_adjusted0 = (img0_clipped)**(gamma) 
+    img_adjusted_clipped = torch.clip(img_adjusted0,0,1)
+    return img_adjusted_clipped.detach()
+
+def Generate_Mi(folder_suffix='completely_random', mode='test', noise=0.5,Affine_mtrx=torch.zeros([2,3]) ):
+    if 'completely_random' in folder_suffix :
+        M_i = torch.normal(torch.zeros([2,3]), torch.ones([2,3]))
+    elif 'random_aff_param' in folder_suffix:
+        M_i =  Generate_random_AffineMatrix(measure=Intitial_Tx, NOISE_LEVEL=noise, device='cpu')[0][0]
+    elif 'mix' in folder_suffix:
+        if mode == 'train':
+            M_i = Affine_mtrx + Affine_mtrx*torch.normal(torch.zeros([2,3]), torch.rand([2,3]))
+        else:
+            M_i = torch.normal(torch.zeros([2,3]), torch.rand([2,3]))
+    else:
+        if (mode == 'train') and (torch.rand([1])<0.5):
+            scheduled_noise = scheduled_parameters()
+            M_i = Affine_mtrx + Affine_mtrx*torch.normal(torch.zeros([2,3]), scheduled_noise*torch.ones([2,3]))
+        else:
+            M_i = torch.zeros_like(Affine_mtrx)
+    return M_i
+
+
+class Dataset(torch.utils.data.Dataset):
+  def __init__(self, list_paths, dim = 128, dim0=224,
+                            batch_size = 25,
+                            DATASET={'train':'active','val':'','test':''},
+                            Img_noise = False, IMG_noise_level = 0,
+                            registration_method= 'Additive_Recurence',
+                            folder_suffix = 'random',
+                            mode= 'train' ):
+        self.list_paths = list_paths[mode]
+        self.dim = dim
+        self.dim0 = dim0
+        self.mode = mode
+        self.activedataset = DATASET[self.mode]
+        self.batch_size = batch_size
+        self.number_examples = len(self.list_paths)
+        self.registration_method = registration_method
+        self.folder_suffix = folder_suffix
+        self.Img_noise = Img_noise
+        self.IMG_noise_level = IMG_noise_level
+  def __len__(self):
+        return int(self.batch_size*(self.number_examples // self.batch_size))
+  def __getitem__(self, index):
+        source_image_path = self.list_paths[index]
+        if self.activedataset == 'active':
+            Outputs = Load_augment(source_image_path, dim = self.dim, dim0= self.dim0)#,Img_noise=self.Img_noise)
+            source = Outputs['source'].to(torch.float32)
+            target = Outputs['target'].to(torch.float32)
+            Affine_mtrx = Outputs['Affine_mtrx']#.to(torch.float32)
+            #Affine_parameters = Outputs['Affine_parameters']#.to(torch.float32)
+        else:
+            source_image_path = self.list_paths[index]
+            source = load_image_pil_accelerated(source_image_path, self.dim).to(torch.float32)
+            target = load_image_pil_accelerated(source_image_path.replace('source','target'),self.dim).to(torch.float32)
+            with open(source_image_path.replace('source','matrix').replace('.JPEG','.npy'), 'rb') as f:
+                Affine_mtrx = torch.from_numpy(np.load(f))
+        if self.Img_noise:
+            source = add_noise2img(source, self.IMG_noise_level)
+            target = add_noise2img(target, self.IMG_noise_level)
+        if 'SIFT' in registration_method:
+            source = torch_img2gray(source.to('cpu'))
+            target = torch_img2gray(target.to('cpu'))
+            Affine_mtrx = Affine_mtrx.to('cpu').numpy()
+        if 'Recurence' in self.registration_method:
+            M_i = Generate_Mi(folder_suffix=self.folder_suffix, mode=self.mode,
+                    noise=Noise_level_dataset, Affine_mtrx= Affine_mtrx )
+            X = {'source':source,
+                'target':target,
+                'M_i' :M_i }
+            if 'Additive' in self.registration_method:
+                Y = {'Affine_mtrx': Affine_mtrx,
+                   'Deviated_mtrx': Affine_mtrx - X['M_i'],}
+            elif 'Multiplicative' in self.registration_method:
+                Y = {'Affine_mtrx': Affine_mtrx,
+                   'Deviated_mtrx': torch.matmul(mtrx3(Affine_mtrx), torch.linalg.inv(mtrx3(X['M_i'])))[0:2,:],}
+        else:
+            X = {'source':source,'target':target}
+            Y = {'Affine_mtrx': Affine_mtrx,}
+        return X,Y
+
+def torch_img2gray(img0):
+ img1 = np.uint8(img0.squeeze().numpy()*255)
+ img1 = cv2.cvtColor(img1.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
+ return img1
+
+train_set = Dataset(list_paths=routes_source,dim = dim, dim0=dim0,  batch_size=batch_size, DATASET=DATASET_generation_split,Img_noise= IMG_noise,IMG_noise_level = IMG_noise_level,
+            registration_method =registration_method,folder_suffix = folder_suffix, mode='train')
+trainloader = torch.utils.data.DataLoader(train_set, batch_size=batch_size,  shuffle=False) #num_workers=4,
+#-------------
+val_set = Dataset(list_paths=routes_source, dim = dim, dim0=dim0, batch_size=batch_size, DATASET=DATASET_generation_split,Img_noise= False, IMG_noise_level = IMG_noise_level,
+                    registration_method =registration_method,folder_suffix = folder_suffix,  mode='val')
+
+valloader = torch.utils.data.DataLoader(val_set, batch_size=batch_size,shuffle=True)
+#-------------
+
+X_item, Y_item = val_set.__getitem__(5)
+dataiter = iter(valloader)
+X_batch, Y_batch = next(dataiter)
+
+
+#---------------Model--------------------------------
+#----------------------------------------------------------
+#----------------------------------------------------------
+#SIFT
+#----------------------------------------------------------
+'''
+img1 = torch_img2gray(img0[0])
+plt.imshow(img1, cmap='gray')
+
+Affine_mtrx = torch.tensor([[[0.8,-0.6,0.5],[0.6, 0.8, 0.5]]])
+moving_images = wrap_imge0(Affine_mtrx,img0.detach())
+img2 = torch_img2gray(moving_images[0])
+plt.imshow(img2, cmap='gray')
+'''
+
+def apply_distance(x):
+ return np.array([k.distance for k in x]).T
+
+def scale_points(points,dim=128):
+    half_dim = dim/2
+    return (points - half_dim)/half_dim
+
+def find_SIFT_matches(img1,img2, Top_n = 7):
+    # Initiate SIFT detector
+    error = False
+    sift = cv2.SIFT_create()
+    # find the keypoints and descriptors with SIFT
+    kp1, des1 = sift.detectAndCompute(img1,None)
+    kp2, des2 = sift.detectAndCompute(img2,None)
+    if (len(kp1)<4) or (len(kp2)<4):
+        X_source= np.random.random([Top_n,2])*(dim/2)
+        X_target = X_source
+        good = []
+        error = True
+    else:
+        FLANN_INDEX_KDTREE = 1
+        index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
+        search_params = dict(checks = 50)
+        flann = cv2.FlannBasedMatcher(index_params, search_params)
+        matches = flann.knnMatch(des1,des2,k=2)
+        matches_array = np.array(matches)
+        ranks = apply_distance(matches_array[:,0])/apply_distance(matches_array[:,1])
+        Top_ni = np.min([Top_n, len(matches)])
+        percntl = 100*Top_ni/len(matches_array)
+        threshold = np.percentile(ranks,percntl)
+        if sum(ranks<=threshold) != Top_ni:
+         print('check number of filtered points does not match the needed points, you may want to adjust the threshold')
+         error = False
+        indices_top_n = np.where(ranks<=threshold)[0]
+        X_source = np.zeros([Top_ni,2])
+        X_target = np.zeros([Top_ni,2])
+        j = 0
+        good = []
+        for indx in indices_top_n:
+            m = matches_array[indx,0]
+            X_source[j] = kp1[m.queryIdx].pt
+            X_target[j]=kp2[m.trainIdx].pt
+            good.append(m)
+            j+=1
+    return X_source, X_target, kp1, kp2, good, error
+
+'''
+X_item, Y_item = val_set.__getitem__(3)
+X_source, X_target, kp1, kp2, good = find_SIFT_matches(X_item['source'],X_item['target'], Top_n = 7)
+src_pts = X_source.reshape(-1,1,2)
+dst_pts = X_target.reshape(-1,1,2)
+M_cv, mask_cv = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC,5.0)
+M_torch, mask_torch = cv2.findHomography(scale_points(src_pts), scale_points(dst_pts), cv2.RANSAC)#,5.0)
+Torch_equivalent_Affine_matrix = np.linalg.inv(M_torch)
+print(Y_item)
+print(Torch_equivalent_Affine_matrix)
+#Plot
+matchesMask = mask_cv.ravel().tolist()
+draw_params = dict(matchColor = (0,255,0), # draw matches in green color
+ singlePointColor = None,
+ matchesMask = matchesMask, # draw only inliers
+ flags = 2)
+img3 = cv2.drawMatches(X_item['source'],kp1,X_item['target'],kp2,good,None,**draw_params)
+plt.imshow(img3, 'gray')
+plt.show()
+plt.savefig(file_savingfolder+'MIRexamples/{}_{}.jpeg'.format('combined','0'), bbox_inches='tight')
+'''
+
+class Build_IRmodel_SIFT(nn.Module):
+    def __init__(self,Top_n=7, save_plot=False):
+        super(Build_IRmodel_SIFT, self).__init__()
+        self.Top_n = Top_n
+        self.save_plot = save_plot
+    def forward(self, input_X_batch):
+        source = input_X_batch['source']
+        target = input_X_batch['target']
+        batch_size_ = source.shape[0]
+        predicted_mtrx =np.zeros([batch_size_,3,3])
+        #Prd_Affine_mtrx = np.zeros([batch_size_,2,3])
+        errors = 0
+        error_nan = 0
+        error_common = 0
+        error_inv = 0
+        error_indices=torch.ones([batch_size])
+        for i in range(batch_size_):
+            X_source, X_target, kp1, kp2, good, error_i = find_SIFT_matches(source[i,:,:].numpy(),target[i,:,:].numpy(), Top_n=self.Top_n)
+            src_pts = X_source.reshape(-1,1,2)
+            dst_pts = X_target.reshape(-1,1,2)
+            M_torch, mask_torch = cv2.findHomography(scale_points(src_pts), scale_points(dst_pts), cv2.RANSAC,5.0)
+            try: M_torch_inv_3x3 = np.linalg.inv(M_torch)
+            except: 
+                M_torch_inv_3x3 = np.eye(3)
+                error_inv += 0
+                error_i = True
+            M_torch_inv_2x3 = M_torch_inv_3x3[:2,:3]
+            M_torch_inv_checked = np.nan_to_num(M_torch_inv_2x3)
+            if np.sum(M_torch_inv_checked == M_torch_inv_2x3) != 6:
+                error_nan +=1
+                if error_i:
+                    error_common +=1
+            if error_i:
+                errors+=1
+                error_indices[i]= 0
+            #Torch_equivalent_Affine_matrix = np.linalg.inv(M_torch)
+            predicted_mtrx[i,:,:] = M_torch
+            #Prd_Affine_mtrx[i,:,:] = M_torch_inv_checked
+            if self.save_plot:
+                M_cv, mask_cv = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC,5.0)
+                matchesMask = mask_cv.ravel().tolist()
+                draw_params = dict(matchColor = (0,255,0), singlePointColor= None, matchesMask = matchesMask, flags = 2)
+                img3 = cv2.drawMatches(source[i,:,:],kp1,target[i,:,:],kp2,good,None,**draw_params)
+                plt.imshow(img3, 'gray')
+                #plt.show()
+                plt.savefig(file_savingfolder+'MIRexamples/{}_{}.jpeg'.format('combined',i), bbox_inches='tight')
+                plot.close()
+        Prd_Affine_mtrx = np.linalg.inv(predicted_mtrx)[:,:2,:3]
+        Prd_Affine_mtrx = np.nan_to_num(Prd_Affine_mtrx)            
+        Prd_Affine_mtrx_torch = torch.tensor(Prd_Affine_mtrx).to(torch.float32)
+        Prd_Affine_mtrx_torch[Prd_Affine_mtrx_torch>2]=2
+        Prd_Affine_mtrx_torch[Prd_Affine_mtrx_torch<-2]=-2
+        predction = {'Affine_mtrx':Prd_Affine_mtrx_torch, 'validity':error_indices}#, 'Errors:':np.array([errors,error_nan,error_common, error_inv]), 'error_indices':error_indices}
+        return predction
+
+
+
+'''
+IR_Model = Build_IRmodel_SIFT(Top_n=7, save_plot=False)
+dataiter = iter(valloader)
+X_batch, Y_batch = next(dataiter)
+pred = IR_Model(X_batch)
+Affine_mtrx = pred['Affine_mtrx']
+
+X_item, Y_item = val_set.__getitem__(5)
+IR_Model(X_batch)
+'''
+
+IR_Model_SIFT = Build_IRmodel_SIFT(Top_n=7, save_plot=False)
+MSE_affine = test_loss(IR_Model_SIFT, testloader,1000, key = 'Affine_mtrx').detach().item()
+print(MSE_affine)
+
+MSE_affine = test_loss(IR_Model_SIFT, testloader0,1000, key = 'Affine_mtrx').detach().item()
+print(MSE_affine)
+
+
+
+#N_expamples = max_iterations*batch_size
+
+IR_Model_SIFT = Build_IRmodel_SIFT(Top_n=7, save_plot=False)
+
+
+def MSE_loss_werror(IR_Model_SIFT, loader=testloader, max_iterations=100):
+    MSE_DL_list = np.array([])
+    MSE_SIFT_list = np.array([])
+    validity_SIFT = np.array([])
+    with torch.no_grad():
+        for i, data in enumerate(loader, 0):
+            if i < max_iterations:
+                inputs, labels = data
+                inputs = move_dict2device(inputs,device)
+                labels = move_dict2device(labels,device)
+                predections_SIFT = IR_Model_SIFT(inputs)
+                err_SIFT_i = torch.mean((labels['Affine_mtrx'] - predections_SIFT['Affine_mtrx'])**2, axis=[1,2])
+                err_SIFT_i = err_SIFT_i.detach().to('cpu').numpy()
+                MSE_SIFT_list = np.concatenate([MSE_SIFT_list,err_SIFT_i])
+                validity_SIFT_i = predections_SIFT['validity'].detach().to('cpu').numpy()
+                validity_SIFT = np.concatenate([validity_SIFT,validity_SIFT_i])
+                #------------------------------------------
+                #predections_DL = IR_Model_tst(inputs)
+                #err_DL_i = torch.mean((labels['Affine_mtrx'] - predections_DL['Affine_mtrx'])**2, axis=[1,2])
+                #err_DL_i = err_DL_i.detach().to('cpu').numpy()
+                #MSE_DL_list = np.concatenate([MSE_DL_list,err_DL_i])
+            else:
+                return MSE_SIFT_list, validity_SIFT
+    return MSE_SIFT_list, validity_SIFT
+
+
+test_set0 = Dataset(list_paths=routes_source,dim = dim, dim0=dim0, batch_size=batch_size, DATASET=DATASET_generation_split,Img_noise= False,IMG_noise_level = 0,
+            registration_method =registration_method,folder_suffix = folder_suffix, mode='test0')
+testloader0 = torch.utils.data.DataLoader(test_set0, batch_size=batch_size,shuffle=False)
+
+
+MSE_SIFT_list0, validity_SIFT0 = MSE_loss_werror(IR_Model_SIFT, loader=testloader0, max_iterations=600)
+
+MSE_All0 = np.mean(MSE_SIFT_list0)
+print('MSE including failing records: ',MSE_All0)
+MSE_Selected0 = np.sum(MSE_SIFT_list0*validity_SIFT0)/np.sum(validity_SIFT0)
+print('MSE excluding failing records: ',MSE_Selected0)
+
+Failure_rate0 = 100*(MSE_SIFT_list0.shape[0] - np.sum(validity_SIFT0)/MSE_SIFT_list0.shape[0]
+print('Failure rate %: ',Failure_rate0)
+
+Noise_level_dataset = 0.0
+def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx): #,'shearX','shearY'
+    wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL)
+    return wrapped_img, Affine_mtrx, Affine_parameters
+
+test_set = Dataset(list_paths=routes_source,dim = dim, dim0=dim0, batch_size=batch_size, DATASET=DATASET_generation_split,Img_noise= True,IMG_noise_level = 0.1,
+            registration_method =registration_method,folder_suffix = folder_suffix, mode='test')
+testloader = torch.utils.data.DataLoader(test_set0, batch_size=batch_size,shuffle=False)
+
+MSE_SIFT_list, validity_SIFT = MSE_loss_werror(IR_Model_SIFT, loader=testloader, max_iterations=600)
+
+MSE_All = np.mean(MSE_SIFT_list)
+print('MSE including failing records: ',MSE_All)
+MSE_Selected = np.sum(MSE_SIFT_list*validity_SIFT)/np.sum(validity_SIFT)
+print('MSE excluding failing records: ',MSE_Selected)
+Failure_rate = 100*(MSE_SIFT_list.shape[0] - np.sum(validity_SIFT))/MSE_SIFT_list.shape[0]
+print('Failure rate %: ',Failure_rate)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+file_savingfolder = '/home/ahmadh/MIR_savedmodel/Additive_Recurence_Mi0:.completely_randomAdjustplot_avgPool__ResNet_active_0.0/'
+if Arch == 'ResNet':
+    core_model_tst = resnet18(pretrained=True)#weights='ResNet18_Weights.IMAGENET1K_V1')
+    
+    if Glopooling == 'avg': #with_pooling:
+        core_model_tst.fc = Identity()
+    else:
+        core_model_tst.avgpool = Identity()
+        core_model_tst = torch.nn.Sequential(*list(core_model_tst.children())[:-2])
+    core_model_tst.load_state_dict(torch.load(file_savingfolder+'core_model'+ext+'.pth'))
+    IR_Model_tst = Build_IRmodel_Resnet(core_model_tst, registration_method,Glopooling,LYR_NORM=LYR_NORM, BW_Position=False)
+
+core_model_tst.to(device)
+IR_Model_tst.load_state_dict(torch.load(file_savingfolder+'IR_Model'+ext+'.pth'))
+IR_Model_tst.to(device)
+IR_Model_tst.eval()
+
+
+
+MSE_DL_list = np.array([])
+MSE_SIFT_list = np.array([])
+validity_SIFT = np.array([])
+with torch.no_grad():
+    for i, data in enumerate(loader, 0):
+        if i < max_iterations:
+            inputs, labels = data
+            inputs = move_dict2device(inputs,device)
+            labels = move_dict2device(labels,device)
+            predections_SIFT = IR_Model_SIFT(inputs)
+            err_SIFT_i = torch.mean((labels['Affine_mtrx'] - predections_SIFT['Affine_mtrx'])**2, axis=[1,2])
+            err_SIFT_i = err_SIFT_i.detach().to('cpu').numpy()
+            MSE_SIFT_list = np.concatenate([MSE_SIFT_list,err_SIFT_i])
+            validity_SIFT_i = predections_SIFT['validity'].detach().to('cpu').numpy()
+            validity_SIFT = np.concatenate([validity_SIFT,validity_SIFT_i])
+            #------------------------------------------
+            
+            predections_DL = IR_Model_tst(inputs)
+            err_DL_i = torch.mean((labels['Affine_mtrx'] - predections_DL['Affine_mtrx'])**2, axis=[1,2])
+            err_DL_i = err_DL_i.detach().to('cpu').numpy()
+            MSE_DL_list = np.concatenate([MSE_DL_list,err_DL_i])
+        else:
+            break
+
+
+'''
+# debuging
+source = X_batch['source']
+target = X_batch['target']
+batch_size_ = source.shape[0]
+#predicted_mtrx =np.zeros([batch_size_,3,3])
+Prd_Affine_mtrx = np.zeros([batch_size_,2,3])
+errors = 0
+error_nan = 0
+error_common = 0
+for i in range(batch_size_):
+    X_source, X_target, kp1, kp2, good, error_i = find_SIFT_matches(source[i,:,:].numpy(),target[i,:,:].numpy(), 7)
+errors += error_i
+src_pts = X_source.reshape(-1,1,2)
+dst_pts = X_target.reshape(-1,1,2)
+M_torch, mask_torch = cv2.findHomography(scale_points(src_pts), scale_points(dst_pts), cv2.RANSAC,3.0)
+M_torch_inv_3x3 = np.linalg.inv(M_torch)
+M_torch_inv_2x3 = M_torch_inv_3x3[:2,:3]
+M_torch_inv_checked = np.nan_to_num(M_torch_inv_2x3)
+if np.sum(M_torch_inv_checked == M_torch_inv_2x3) != 6:
+    error_nan +=1
+    if error_i:
+        error_common +=1
+    else:
+        errors+=1
+#Torch_equivalent_Affine_matrix = np.linalg.inv(M_torch)
+#predicted_mtrx[i,:,:] = M_torch_inv_checked
+Prd_Affine_mtrx[i,:,:] = M_torch_inv_checked
+            
+ '''           
+    src_pts = X_source.reshape(-1,1,2)
+    dst_pts = X_target.reshape(-1,1,2)
+    M_torch, mask_torch = cv2.findHomography(scale_points(src_pts), scale_points(dst_pts), cv2.RANSAC,5.0)
+    #Torch_equivalent_Affine_matrix = np.linalg.inv(M_torch)
+    predicted_mtrx[i,:,:] = M_torch
+'''
+
+i=8
+X_source, X_target, kp1, kp2, good, err = find_SIFT_matches(source[i,:,:].numpy(),target[i,:,:].numpy(), 7)
+
+img1 = source[i,:,:].numpy()
+img2 = target[i,:,:].numpy()
+sift = cv2.SIFT_create()
+error = False
+sift = cv2.SIFT_create()
+# find the keypoints and descriptors with SIFT
+kp1, des1 = sift.detectAndCompute(img1,None)
+kp2, des2 = sift.detectAndCompute(img2,None)
+if (len(kp1)<4) or (len(kp2)<4):
+    X_source= np.random.random([Top_n,2])*(dim/2)
+    X_target = X_source
+    good = []
+    error = True
+else:
+FLANN_INDEX_KDTREE = 1
+index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
+search_params = dict(checks = 50)
+flann = cv2.FlannBasedMatcher(index_params, search_params)
+matches = flann.knnMatch(des1,des2,k=2)
+matches_array = np.array(matches)
+ranks = apply_distance(matches_array[:,0])/apply_distance(matches_array[:,1])
+Top_ni = np.min([Top_n, len(matches)])
+percntl = 100*Top_ni/len(matches_array)
+threshold = np.percentile(ranks,percntl)
+if sum(ranks<=threshold) != Top_ni:
+ print('check number of filtered points does not match the needed points, you may want to adjust the threshold')
+ error = False
+indices_top_n = np.where(ranks<=threshold)[0]
+X_source = np.zeros([Top_ni,2])
+X_target = np.zeros([Top_ni,2])
+j = 0
+good = []
+for indx in indices_top_n:
+ m = matches_array[indx,0]
+ X_source[j] = kp1[m.queryIdx].pt
+ X_target[j]=kp2[m.trainIdx].pt
+ good.append(m)
+ j+=1
+
+
+
+
+
+
+
+
+source = input_X_batch['source']
+target = input_X_batch['target']
+batch_size_ = source.shape[0]
+#predicted_mtrx =np.zeros([batch_size_,3,3])
+Prd_Affine_mtrx = np.zeros([batch_size_,2,3])
+errors = 0
+error_nan = 0
+error_common = 0
+for i in range(batch_size_):
+    X_source, X_target, kp1, kp2, good, error_i = find_SIFT_matches(source[i,:,:].numpy(),target[i,:,:].numpy(), Top_n=self.Top_n)
+    errors += error_i
+    src_pts = X_source.reshape(-1,1,2)
+    dst_pts = X_target.reshape(-1,1,2)
+    M_torch, mask_torch = cv2.findHomography(scale_points(src_pts), scale_points(dst_pts), cv2.RANSAC,5.0)
+    M_torch_inv_3x3 = np.linalg.inv(M_torch)
+    M_torch_inv_2x3 = M_torch_inv_3x3[:2,:3]
+    M_torch_inv_checked = np.nan_to_num(M_torch_inv_2x3)
+    if np.sum(M_torch_inv_checked == M_torch_inv_2x3) != 6:
+        error_nan +=1
+        if error_i:
+            error_common +=1
+        else:
+            errors+=1
+    #Torch_equivalent_Affine_matrix = np.linalg.inv(M_torch)
+    #predicted_mtrx[i,:,:] = M_torch_inv_checked
+    Prd_Affine_mtrx[i,:,:] = M_torch_inv_checked
+    if self.save_plot:
+        M_cv, mask_cv = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC,5.0)
+        matchesMask = mask_cv.ravel().tolist()
+        draw_params = dict(matchColor = (0,255,0), singlePointColor= None, matchesMask = matchesMask, flags = 2)
+        img3 = cv2.drawMatches(source[i,:,:],kp1,target[i,:,:],kp2,good,None,**draw_params)
+        plt.imshow(img3, 'gray')
+        #plt.show()
+        plt.savefig(file_savingfolder+'MIRexamples/{}_{}.jpeg'.format('combined',i), bbox_inches='tight')
+        plot.close()
+#Prd_Affine_mtrx = np.linalg.inv(predicted_mtrx)[:,:2,:3]
+#Prd_Affine_mtrx = np.nan_to_num(Prd_Affine_mtrx)            
+Prd_Affine_mtrx_torch = torch.tensor(Prd_Affine_mtrx).to(torch.float32)
+predction = {'Affine_mtrx':Prd_Affine_mtrx_torch , 'Errors:':np.array([errors,error_nan,error_common])}
+return predction
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+i=14
+X_source, X_target, kp1, kp2, good = find_SIFT_matches(source[i,:,:].numpy(),target[i,:,:].numpy(), 7)
+
+img1 = source[i,:,:].numpy()
+img2 = target[i,:,:].numpy()
+sift = cv2.SIFT_create()
+# find the keypoints and descriptors with SIFT
+kp1, des1 = sift.detectAndCompute(img1,None)
+kp2, des2 = sift.detectAndCompute(img2,None)
+if (len(kp1)<4) or (len(kp2)<4):
+    X_source= np.random.random([Top_n,2])*dim
+    X_target = X_source
+else:
+FLANN_INDEX_KDTREE = 1
+index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
+search_params = dict(checks = 50)
+flann = cv2.FlannBasedMatcher(index_params, search_params)
+matches = flann.knnMatch(des1,des2,k=2)
+matches_array = np.array(matches)
+ranks = apply_distance(matches_array[:,0])/apply_distance(matches_array[:,1])
+Top_ni = np.min([Top_n, len(matches)])
+percntl = 100*Top_ni/len(matches_array)
+threshold = np.percentile(ranks,percntl)
+if sum(ranks<=threshold) != Top_ni:
+ print('check number of filtered points does not match the needed points, you may want to adjust the threshold')
+indices_top_n = np.where(ranks<=threshold)[0]
+X_source = np.zeros([Top_ni,2])
+X_target = np.zeros([Top_ni,2])
+j = 0
+good = []
+for indx in indices_top_n:
+    m = matches_array[indx,0]
+    X_source[j] = kp1[m.queryIdx].pt
+    X_target[j]=kp2[m.trainIdx].pt
+    good.append(m)
+    j+=1
+
+'''
+
+
+src_pts = X_source.reshape(-1,1,2)
+dst_pts = X_target.reshape(-1,1,2)
+M_torch, mask_torch = cv2.findHomography(scale_points(src_pts), scale_points(dst_pts), cv2.RANSAC,5.0)
+#Torch_equivalent_Affine_matrix = np.linalg.inv(M_torch)
+predicted_mtrx[i,:,:] = M_torch
+
+
+
+
+
+
+#---------------Model--------------------------------
+#----------------------------------------------------------
+#----------------------------------------------------------
+#ResNet
+#----------------------------------------------------------
+def custom_init(m):
+    depth = m.shape[0]
+    side = m.shape[1] // depth
+    for l in range(depth):
+        min_idx = side * l
+        max_idx = side * (l+1)
+        mask = torch.ones_like(m[l], dtype=torch.bool)
+        mask[min_idx:max_idx] = False
+        m[l][mask] = 0
+
+
+class Build_IRmodel_Resnet(nn.Module):
+    def __init__(self, resnet_model, registration_method = 'Rawblock', Glopooling = 'avg', LYR_NORM=True, BW_Position=False):
+        super(Build_IRmodel_Resnet, self).__init__()
+        self.resnet_model = resnet_model
+        self.LYR_NORM = LYR_NORM
+        self.BW_Position = BW_Position
+        self.Glopooling = Glopooling#'max'#'max', 'avg', 'none', 'Bastien'
+        self.Layer_Norm = nn.LayerNorm([3,128,128])
+        self.adapmaxpool = nn.AdaptiveMaxPool2d((1,1))
+        self.flat = torch.nn.Flatten()
+        if registration_method=='matching_points':
+            self.N_parameters = 18
+        else:
+            self.N_parameters = 6
+        self.registration_method = registration_method
+        self.fc1 =nn.Linear(6, 64)
+        self.fc2 =nn.Linear(64, 128*3)
+        if self.Glopooling=='none':
+            if 'Recurence' in self.registration_method:
+                self.fci = nn.Linear(18432, 100)
+                self.ReLU = nn.ReLU()
+                self.fcii = nn.Linear(100, 100)
+                self.fc3 =nn.Linear(100, self.N_parameters)
+            else:
+                self.fc3 =nn.Linear(16840, self.N_parameters) #check this number
+        elif self.Glopooling=='Bastien':
+            if 'Recurence' in self.registration_method:
+                self.fc3 =nn.Linear(18432, self.N_parameters)
+            else:
+                self.fc3 =nn.Linear(16840, self.N_parameters)
+            custom_init(self.fc3.weight.data)
+        else:
+             self.fc3 =nn.Linear(512, self.N_parameters)
+        #self.global_avg_pooling = nn.AdaptiveAvgPool2d(10)
+    def forward(self, input_X_batch):
+        source = input_X_batch['source']
+        target = input_X_batch['target']
+        if self.LYR_NORM:
+            source = self.Layer_Norm(source)
+            target = self.Layer_Norm(target)
+        if self.BW_Position:
+            source = batch_ToBWposition(source)
+            target = batch_ToBWposition(target)
+        if 'Recurence' in self.registration_method:
+            M_i = input_X_batch['M_i'].view(-1, 6)
+            #-------------------------------------
+            M_rep = F.relu(self.fc1(M_i))
+            M_rep = F.relu(self.fc2(M_rep)).view(-1,3,1,128)
+            #-------------------------------------
+            concatenated_input = torch.cat((source,target,M_rep), dim=2)
+        else:
+            concatenated_input = torch.cat((source,target), dim=2)
+        resnet_output = self.resnet_model(concatenated_input)
+        if self.Glopooling=='Bastien':
+            resnet_output = self.flat(resnet_output)
+        elif self.Glopooling=='none':
+            resnet_output = self.flat(resnet_output)
+        elif self.Glopooling=='max':
+            resnet_output = self.adapmaxpool(resnet_output).squeeze()
+        #x = self.global_avg_pooling(Unet_output)
+        #x = torch.flatten(x, 1) # flatten all dimensions except batch
+        predicted_line = self.fc3(resnet_output)
+        if self.registration_method=='matching_points':
+            predcited_points = predicted_line.view(-1, 2, 3, 3)
+            XY_source = predcited_points[:,1,:,:]
+            if '1' in folder_suffix:
+                XY_source[:,:,2] = 0.
+            XY_source[:,2,:] = 1.
+            XY_target = predcited_points[:,0,0:2,:]
+            Prd_Affine_mtrx = torch.matmul(XY_target, torch.linalg.inv(XY_source)) 
+            predction = {'Affine_mtrx': Prd_Affine_mtrx,
+                        'XY_source':XY_source,
+                       'XY_target':XY_target,}
+        elif 'Recurence' in self.registration_method:
+            predicted_part_mtrx = predicted_line.view(-1, 2, 3)
+            if 'Additive' in self.registration_method:
+                Prd_Affine_mtrx = predicted_part_mtrx + input_X_batch['M_i']
+            elif 'Multiplicative' in self.registration_method:
+                Prd_Affine_mtrx = torch.matmul(mtrx3(predicted_part_mtrx), mtrx3(input_X_batch['M_i']))[:,0:2,:]
+            predction = {'predicted_part_mtrx':predicted_part_mtrx,
+                            'Affine_mtrx': Prd_Affine_mtrx}
+        else:
+            Prd_Affine_mtrx = predicted_line.view(-1, 2, 3)
+            predction = {'Affine_mtrx': Prd_Affine_mtrx}
+        return predction
+
+
+if Arch == 'ResNet':
+    core_model = resnet18(pretrained=True)#weights='ResNet18_Weights.IMAGENET1K_V1')
+    if Glopooling == 'avg': #with_pooling:
+        core_model.fc = Identity()
+    else:
+        core_model.avgpool = Identity()
+        core_model = torch.nn.Sequential(*list(core_model.children())[:-2])
+    IR_Model = Build_IRmodel_Resnet(core_model, registration_method,Glopooling, LYR_NORM=LYR_NORM, BW_Position=False)
+    core_model.to(device)
+    IR_Model.to(device)
+
+
+dataiter = iter(valloader)
+X_batch, Y_batch = next(dataiter)
+
+X_batch = move_dict2device(X_batch,device)
+Y_batch = move_dict2device(Y_batch,device)
+
+pred = IR_Model(X_batch)
+Affine_mtrx = pred['Affine_mtrx']
+
+
+#---------------Train--------------------------------
+#----------------------------------------------------------
+#----------------------------------------------------------
+
+def scheduled_parameters(epoch = 0, Total_epochs=15):
+    sceduled_noise = epoch/Total_epochs
+    return sceduled_noise
+
+def eval_loss(loader, max_iterations=100, key = 'Affine_mtrx'):
+    eval_loss_tot = 0
+    with torch.no_grad():
+        for i, data in enumerate(loader, 0):
+            if i < max_iterations:
+                inputs, labels = data
+                inputs = move_dict2device(inputs,device)
+                labels = move_dict2device(labels,device)
+                predections = IR_Model(inputs)
+                eval_loss_tot += MSE_loss(labels[key], predections[key].detach())
+                eval_loss_avg = eval_loss_tot/i
+            else :
+                return eval_loss_avg
+    return eval_loss_avg
+
+def threshold(numberX, max_threshold=2):
+    if numberX>max_threshold:
+        return max_threshold
+    else:
+        return numberX
+
+
+
+Learning_rate = 0.001
+print_every = 2000
+
+MSE_loss = torch.nn.functional.mse_loss
+optimizer = optim.AdamW(IR_Model.parameters(), lr=Learning_rate)#, momentum=0.9
+
+training_loss_epochslist = []
+validation_loss_epochslist = []
+training_loss_iterationlist = []
+validation_loss_iterationlist = []
+
+TOTAL_Epochs = 12
+best_loss = 100000000000000000000
+for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
+    i=-1
+    running_loss = 0.0
+    if 'scheduledrandom' in folder_suffix:
+        def scheduled_parameters(epoch = EPOCH, Total_epochs=TOTAL_Epochs):
+            sceduled_noise = epoch/Total_epochs
+            if epoch>12:
+                sceduled_noise = 1
+            return sceduled_noise
+        print('epoch:', EPOCH,', scheduled noise:' , scheduled_parameters())
+    for inputs, labels in tqdm.tqdm(trainloader):
+        i+=1
+        inputs = move_dict2device(inputs,device)
+        labels = move_dict2device(labels,device)
+        optimizer.zero_grad()
+        predections = IR_Model(inputs)
+        loss_item = {}
+        loss = MSE_loss(labels['Affine_mtrx'], predections['Affine_mtrx'])
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.detach().item()
+        if i >0:
+            if i % print_every == 0:    # print every 2000 mini-batches
+                eval_loss_x = eval_loss(valloader,int(2000/batch_size),'Affine_mtrx').detach().item()
+                training_loss_iterationlist.append( threshold(running_loss/print_every))
+                validation_loss_iterationlist.append(threshold(eval_loss_x))
+                printed_text = f'[epoch:{EPOCH}, iter:{i:5d}], training loss: {running_loss/print_every:.3f}, eval loss:{eval_loss_x:.3f}'
+                print(printed_text)
+                if i >1:
+                    if eval_loss_x<best_loss:
+                        best_loss = eval_loss_x
+                        torch.save(IR_Model.state_dict(), file_savingfolder+'IR_Model_bestVal.pth')
+                        torch.save(core_model.state_dict(), file_savingfolder+'./core_model_bestVal.pth')
+                running_loss = 0.0
+    plt.plot(training_loss_iterationlist, label = 'training loss')
+    plt.plot(validation_loss_iterationlist, label = 'validation loss')
+    plt.legend()
+    plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
+    plt.close()
+    np.savetxt(file_savingfolder+'training_loss_iterationlist.txt', training_loss_iterationlist, delimiter=",", fmt="%.3f")
+    np.savetxt(file_savingfolder+'validation_loss_iterationlist.txt', validation_loss_iterationlist, delimiter=",", fmt="%.3f")
+    save_examples(IR_Model,valloader, n_examples = 6, plt_elipses=True,plt_imgs=True)
+    if with_epch_loss:
+        training_loss_epochslist.append(threshold(eval_loss(trainloader,int(10000/batch_size),'Affine_mtrx').detach().item()))
+        validation_loss_epochslist.append(threshold(eval_loss(valloader,int(10000/batch_size),'Affine_mtrx').detach().item()))
+        plt.plot(training_loss_epochslist, marker='o', label = 'epoch training loss')
+        plt.plot(validation_loss_epochslist, marker='x', label = 'epoch validation loss')
+        plt.legend()
+        plt.savefig(file_savingfolder+'loss_epochs.png', bbox_inches='tight')
+        plt.close()
+        np.savetxt(file_savingfolder+'training_loss_epochslist.txt', training_loss_epochslist, delimiter=",", fmt="%.3f")
+        np.savetxt(file_savingfolder+'validation_loss_epochslist.txt', validation_loss_epochslist, delimiter=",", fmt="%.3f")
+
+print('Finished Training')
+torch.save(IR_Model.state_dict(), file_savingfolder+'IR_Model_EndTraining.pth')
+torch.save(core_model.state_dict(), file_savingfolder+'./core_model_EndTraining.pth')
+
+
+if with_epch_loss:
+    with open(file_savingfolder+'training_loss_epochslist.npy', 'wb') as f:
+        np.save(f, np.array(training_loss_epochslist))
+        
+    with open(file_savingfolder+'validation_loss_epochslist.npy', 'wb') as f:
+        np.save(f, np.array(validation_loss_epochslist))
+        
+    plt.plot(training_loss_epochslist, label = 'training loss')
+    plt.plot(validation_loss_epochslist, label = 'validation loss')
+    plt.legend()
+    plt.savefig(file_savingfolder+'loss_epochs.png', bbox_inches='tight')
+    plt.close()
+
+with open(file_savingfolder+'training_loss_iterationlist.npy', 'wb') as f:
+    np.save(f, np.array(training_loss_iterationlist))
+
+with open(file_savingfolder+'validation_loss_iterationlist.npy', 'wb') as f:
+    np.save(f, np.array(validation_loss_iterationlist))
+
+
+plt.plot(training_loss_iterationlist, label = 'training loss')
+plt.plot(validation_loss_iterationlist, label = 'validation loss')
+plt.legend()
+plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
+plt.close()
+
+#---------------Test--------------------------------
+#----------------------------------------------------------
+#----------------------------------------------------------
+
+if 'SIFT' in registration_method:
+    IR_Model_tst = Build_IRmodel_SIFT(Top_n=7, save_plot=False)
+
+
+    #Load best model saved on drive
+ext = '_EndTraining'#'_EndTraining' #_bestVal
+
+if Arch == 'ResNet':
+    core_model_tst = resnet18(pretrained=True)#weights='ResNet18_Weights.IMAGENET1K_V1')
+    
+    if Glopooling == 'avg': #with_pooling:
+        core_model_tst.fc = Identity()
+    else:
+        core_model_tst.avgpool = Identity()
+        core_model_tst = torch.nn.Sequential(*list(core_model_tst.children())[:-2])
+    core_model_tst.load_state_dict(torch.load(file_savingfolder+'core_model'+ext+'.pth'))
+    IR_Model_tst = Build_IRmodel_Resnet(core_model_tst, registration_method,Glopooling,LYR_NORM=LYR_NORM, BW_Position=False)
+    
+
+core_model_tst.to(device)
+IR_Model_tst.load_state_dict(torch.load(file_savingfolder+'IR_Model'+ext+'.pth'))
+IR_Model_tst.to(device)
+IR_Model_tst.eval()
+
+
+#----------------------------
+#Load test dataset
+
+test_set = Dataset(list_paths=routes_source,dim = dim, dim0=dim0, batch_size=batch_size, DATASET=DATASET_generation_split,Img_noise= True,IMG_noise_level = IMG_noise_level,
+            registration_method =registration_method,folder_suffix = folder_suffix, mode='test')
+testloader = torch.utils.data.DataLoader(test_set, batch_size=batch_size,shuffle=False)
+
+
+test_set0 = Dataset(list_paths=routes_source,dim = dim, dim0=dim0, batch_size=batch_size, DATASET=DATASET_generation_split,Img_noise= False,IMG_noise_level = IMG_noise_level,
+            registration_method =registration_method,folder_suffix = folder_suffix, mode='test0')
+testloader0 = torch.utils.data.DataLoader(test_set0, batch_size=batch_size,shuffle=False)
+
+
+file_savingfolder_test = file_savingfolder+'test/'
+os.system('mkdir '+ file_savingfolder_test)
+os.system('mkdir '+ file_savingfolder_test+ 'MIRexamples')
+
+file_savingfolder = file_savingfolder_test
+#----------------------------
+
+##------------------------------------------------------------------
+## Plot deviation graph of each augmentation parameter from the the ground-truth
+##------------------------------------------------------------------
+# 1- fix three parameters and sample from one
+# 2- plot the distrinution of the error for the variable parameter
+# fixed values s =1, angle =0, translation =0
+# MSE_AffineMatrix_1measure
+#test_routes = glob.glob('../../localdb/224/test/'+"**/*.JPEG", recursive = True)
+Measures_list = ['angle', 'scale', 'translationX','translationY','shearX','shearY']
+num2txt= {  '0': 'angle', '1': 'scale', '2': 'translationX','3': 'translationY', '4': 'shearX','5': 'shearY'}
+txt2num ={'angle':0, 'scale':1, 'translationX':2, 'translationY':3, 'shearX':4,'shearY':5}
+
+MSE_loss = torch.nn.functional.mse_loss
+
+def test_loss(model, loader=testloader, max_iterations=100, key = 'Affine_mtrx'):
+    eval_loss_tot = 0
+    with torch.no_grad():
+        for i, data in enumerate(loader, 0):
+            if i < max_iterations:
+                inputs, labels = data
+                inputs = move_dict2device(inputs,device)
+                labels = move_dict2device(labels,device)
+                predections = model(inputs)
+                eval_loss_tot += MSE_loss(labels[key], predections[key].detach())
+                eval_loss_avg = eval_loss_tot/i
+            else :
+                return eval_loss_avg
+    return eval_loss_avg
+
+#IR_Model_tst = Build_IRmodel_SIFT(Top_n=7, save_plot=False)
+MSE_affine = test_loss(IR_Model_tst, testloader,100, key = 'Affine_mtrx').detach().item()
+print(MSE_affine)
+json.dump( MSE_affine, open( file_savingfolder+'Test_loss.txt', 'w' ) )
+#np.savetxt(file_savingfolder+'Test_loss.txt', np.array([MSE_affine]), delimiter=",", fmt="%.5f")
+
+MSE_affine = test_loss(IR_Model_tst, testloader0,1000, key = 'Affine_mtrx').detach().item()
+print(MSE_affine)
+json.dump( MSE_affine, open( file_savingfolder+'Test_loss0.txt', 'w' ) )
+
+
+save_examples(IR_Model_tst,testloader, n_examples = 6)
+save_n_examples(IR_Model_tst, testloader, n_times=2, n_examples_per_time = 4 )
+
+
+##------------------------------------------------------------------
+## Ensemble additive model
+##------------------------------------------------------------------
+if with_shear:
+    Intitial_Tx = ['angle', 'scale', 'translationX','translationY','shearX','shearY'] #,{'shearX','shearY'}
+else:
+    Intitial_Tx = ['angle', 'scale', 'translationX','translationY'] #,'shearX','shearY'] #,{'shearX','shearY'}
+
+def Generate_Mi_batch(batch_size= batch_size, Matrix_initialization=folder_suffix, mode='test',
+                        MI_noise=0.5,Affine_mtrx=torch.zeros([batch_size,2,3]) ):
+    if 'completely_random' in Matrix_initialization :
+        M_i = torch.normal(torch.zeros([batch_size,2,3]), MI_noise*torch.ones([batch_size,2,3]))
+    elif 'random_aff_param' in Matrix_initialization:
+        M_i = torch.zeros_like(Affine_mtrx)
+        for k in range(batch_size):
+            M_i[k,:,:] =  Generate_random_AffineMatrix(measure=Intitial_Tx, NOISE_LEVEL=MI_noise, device='cpu')[0][0]
+    elif 'mix' in Matrix_initialization:
+        if mode == 'train':
+            M_i = Affine_mtrx + Affine_mtrx*torch.normal(torch.zeros([batch_size,2,3]), torch.rand([batch_size,2,3]))
+        else:
+            M_i = torch.normal(torch.zeros([2,3]), torch.rand([2,3]))
+    else:
+        if (mode == 'train') and (torch.rand([1])<0.5):
+            scheduled_noise = scheduled_parameters()
+            M_i = Affine_mtrx + Affine_mtrx*torch.normal(torch.zeros([batch_size,2,3]), scheduled_noise*torch.ones([batch_size,2,3]))
+        else:
+            M_i = torch.zeros_like(Affine_mtrx)
+    return M_i
+
+class Build_Ensemble_IRmodel(nn.Module):
+    def __init__(self, model, Num_iterations=10, key = 'Affine_mtrx',mode='test', Matrix_initialization=folder_suffix,MI_noise=1,AM=torch.zeros([batch_size,2,3])):
+        super(Build_Ensemble_IRmodel, self).__init__()
+        self.model = model
+        self.Matrix_initialization = Matrix_initialization
+        self.MI_noise = MI_noise
+        self.AM = AM
+        self.mode = mode
+        self.Num_iterations = Num_iterations
+        self.key =key
+    def forward(self, input_X_batch):
+        predction= {}
+        input_X_batch['M_i'] = Generate_Mi_batch(batch_size= batch_size, Matrix_initialization=self.Matrix_initialization, mode=self.mode,
+                        MI_noise=self.MI_noise,Affine_mtrx=self.AM ).to(device)
+        predction[self.key] = self.model(input_X_batch)[self.key]
+        for i in range(1,self.Num_iterations):
+            input_X_batch['M_i'] = Generate_Mi_batch(batch_size= batch_size, Matrix_initialization=self.Matrix_initialization, mode=self.mode,
+                        MI_noise=self.MI_noise,Affine_mtrx=self.AM).to(device)
+            #input_X_batch['M_i'] = torch.zeros_like(input_X_batch['M_i'])
+            predction[self.key] += self.model(input_X_batch)[self.key].detach()
+        predction[self.key]/= self.Num_iterations
+        return predction
+
+
+MTRX_Initialisation='completely_random'
+MI_noise = 1
+ensemble_loss ={}
+for n_models in [1, 3, 10, 20]:
+    Ensemble_model = Build_Ensemble_IRmodel(IR_Model_tst, Num_iterations=n_models,Matrix_initialization=MTRX_Initialisation, MI_noise=MI_noise )
+    Ensemble_model.eval()
+    ensemble_loss[str(n_models)]= test_loss(Ensemble_model, testloader,200, key = 'Affine_mtrx').detach().item()
+    #print(ensemble_loss[str(n_models)])
+
+print(ensemble_loss)
+json.dump( ensemble_loss, open( file_savingfolder+'Horizontal_recurrence'+MTRX_Initialisation+'.txt', 'w' ) )
+
+#----------------------
+#Find the average variance between the predictions obtained by ensemble models, and also the MSE 
+ 
+def Ensemble_stat(model, datloader=testloader, Num_models=10, Num_batches=1 , key = 'Affine_mtrx',
+                            Matrix_initialization=folder_suffix, mode='test', MI_noise=1, AM=torch.zeros([batch_size,2,3]),Reduce=True):
+    predections= {}
+    with torch.no_grad():
+        dataiter = iter(datloader)
+        batch_size = AM.shape[0]
+        #predections['all'] = torch.zeros(Num_models,Num_batches,2,3)
+        predections_batch = torch.zeros(Num_models,batch_size,2,3).to(device)
+        error2 = torch.zeros(2,3).to(device)
+        SE = 0
+        models_var = torch.zeros(2,3).to(device)
+        for j in range(Num_batches):
+            #load a batch
+            X_batch, Y_batch = next(dataiter)
+            X_batch = move_dict2device(X_batch,device)
+            Y_batch = move_dict2device(Y_batch,device)
+            # test the page with the max number of models, then sample for lower numbers
+            for i in range(Num_models):
+                X_batch['M_i'] = Generate_Mi_batch(batch_size= batch_size, Matrix_initialization=Matrix_initialization,
+                                                    mode=mode, MI_noise=MI_noise,Affine_mtrx=AM ).to(device)
+                prd = model(X_batch)
+                predections_batch[i,:,:,:]= prd[key]
+            Avg_predection = torch.mean(predections_batch, dim=[0])
+            models_var += torch.mean(torch.var(predections_batch, dim=[0]), dim=[0])
+            error2 += torch.mean((Y_batch[key] - Avg_predection)**2, dim=[0])
+    # This yields 2x3 matrix
+    predections['models_var_matrix']= (models_var/Num_batches)#.tolist()
+    predections['MSE_matrix']= (error2/(Num_batches))#.tolist()#to('cpu').numpy()
+    # This yields a single number
+    predections['mean_models_var'] = torch.mean(predections['models_var_matrix']).item()
+    predections['MSE'] = torch.mean(predections['MSE_matrix']).item()
+    return predections
+
+
+
+Stats ={}
+Summary ={}
+Summary['mean_models_var'] ={}
+Summary['MSE'] ={}
+for MI_noise in [0,0.2, 0.5, 1, 1.5,  2]:
+    Statm={}
+    Summary['mean_models_var'][str(MI_noise)]={}
+    Summary['MSE'][str(MI_noise)]={}
+    for n_models in [1, 3, 10, 20]:
+        Statm[str(n_models)]= Ensemble_stat(IR_Model_tst, testloader, Num_models=n_models, Num_batches=200 , key = 'Affine_mtrx', 
+                                                        Matrix_initialization=folder_suffix, mode='test',MI_noise=MI_noise, AM=torch.zeros([batch_size,2,3]))
+        Summary['mean_models_var'][str(MI_noise)][str(n_models)]=Statm[str(n_models)]['mean_models_var']
+        Summary['MSE'][str(MI_noise)][str(n_models)]=Statm[str(n_models)]['MSE']
+        json.dump( Statm[str(n_models)]['models_var_matrix'].tolist(), open( file_savingfolder+'{}_Stats_modelVar_{}_{}.txt'.format(n_models,MTRX_Initialisation,MI_noise),'w' ) )
+        json.dump( Statm[str(n_models)]['MSE_matrix'].tolist(), open( file_savingfolder+'{}_Stats_MSE_{}_{}.txt'.format(n_models,MTRX_Initialisation,MI_noise), 'w' ) )
+    Stats[str(MI_noise)]=Statm
+
+print(Summary)
+json.dump( Summary, open( file_savingfolder+'_()_Stats_Summary_{}.txt'.format(MTRX_Initialisation), 'w' ), indent=3 )
+
+
+
+
+MTRX_Initialisation = 'random_aff_param'
+
+Stats ={}
+Summary ={}
+Summary['mean_models_var'] ={}
+Summary['MSE'] ={}
+for MI_noise in [0,0.2, 0.5, 1, 1.5,  2]:
+    Statm={}
+    Summary['mean_models_var'][str(MI_noise)]={}
+    Summary['MSE'][str(MI_noise)]={}
+    for n_models in [1, 3, 10, 20]:
+        Statm[str(n_models)]= Ensemble_stat(IR_Model_tst, testloader, Num_models=n_models, Num_batches=200 , key = 'Affine_mtrx', 
+                                                        Matrix_initialization=MTRX_Initialisation, mode='test',MI_noise=MI_noise, AM=torch.zeros([batch_size,2,3]))
+        Summary['mean_models_var'][str(MI_noise)][str(n_models)]=Statm[str(n_models)]['mean_models_var']
+        Summary['MSE'][str(MI_noise)][str(n_models)]=Statm[str(n_models)]['MSE']
+        json.dump( Statm[str(n_models)]['models_var_matrix'].tolist(), open( file_savingfolder+'{}_Stats_modelVar_{}_{}.txt'.format(n_models,MTRX_Initialisation,MI_noise),'w' ) )
+        json.dump( Statm[str(n_models)]['MSE_matrix'].tolist(), open( file_savingfolder+'{}_Stats_MSE_{}_{}.txt'.format(n_models,MTRX_Initialisation,MI_noise), 'w' ) )
+    Stats[str(MI_noise)]=Statm
+
+print(Summary)
+json.dump( Summary, open( file_savingfolder+'Stats_Summary_{}.txt'.format(MTRX_Initialisation), 'w' ), indent=3 )
+
+
+
+
+
+
+
+
+
+##------------------------------------------------------------------
+## Recurrent estimation of the Affine matrix
+##------------------------------------------------------------------
+def recurrent_loss(model,loader = testloader, max_iterations=100, No_recurences = 5, key ='Affine_mtrx'):
+    eval_loss_tot = {}
+    eval_loss_avg = {}
+    for j in range(No_recurences):
+        eval_loss_tot[str(j)]=0
+    with torch.no_grad():
+        for i, data in enumerate(testloader, 0):
+            if i < max_iterations:
+                inputs, labels = data
+                inputs = move_dict2device(inputs,device)
+                labels = move_dict2device(labels,device)
+                predections = model(inputs)
+                eval_loss_tot[str(0)] += MSE_loss(labels[key].detach(), predections[key].detach()).item()
+                for j in range(1, No_recurences):
+                    inputs_j ={'source': inputs['source'],
+                                'target': inputs['target'],
+                                'M_i': predections['Affine_mtrx'].detach()}
+                    predections = model(inputs_j)
+                    eval_loss_tot[str(j)] += MSE_loss(labels[key].detach(), predections[key].detach()).item()
+            else :
+                for j in range(No_recurences):
+                    eval_loss_avg[str(j)] = eval_loss_tot[str(j)]/max_iterations
+                return eval_loss_avg
+
+No_recurences = 5
+if 'Recurence' in registration_method:
+    Noise_level_testset=0.5
+    def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_MESURE= Intitial_Tx): #['angle', 'scale', 'translationX','translationY','shearX','shearY']
+            wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL)
+            return wrapped_img, Affine_mtrx, Affine_parameters
+    MSE_recurrent_sigmahalf = recurrent_loss(model=IR_Model_tst,loader=testloader, max_iterations=200, No_recurences = No_recurences)
+    print('REcurrent MSE when Noise_level_testset=0.5:', MSE_recurrent_sigmahalf)
+    json.dump( MSE_recurrent_sigmahalf, open( file_savingfolder+'MSE_recurrent_sigmahalf.txt', 'w' ) )
+    #np.savetxt(file_savingfolder+'Test_loss_recurrences_Sigmahalf.txt', np.array([MSE_recurrent_sigmahalf]), delimiter=",", fmt="%.5f")
+
+
+if 'Recurence' in registration_method:
+    Noise_level_testset=0.0
+    def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_MESURE= Intitial_Tx): #['angle', 'scale', 'translationX','translationY','shearX','shearY']
+            wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL)
+            return wrapped_img, Affine_mtrx, Affine_parameters
+    MSE_recurrent_sigma0 = recurrent_loss(model=IR_Model_tst,loader=testloader, max_iterations=200, No_recurences = No_recurences)
+    print('MSE when Noise_level_testset=0.0:', MSE_recurrent_sigma0)
+    json.dump( MSE_recurrent_sigma0, open( file_savingfolder+'MSE_recurrent_sigma0.txt', 'w' ) )
+    #np.savetxt(file_savingfolder+'Test_loss_recurrences_Sigma0.txt', np.array([MSE_recurrent_sigma0]), delimiter=",", fmt="%.5f")
+
+
+#Test Loss when sigma =0 and 1 transformation
+#------------------------------------------------
+
+Noise_level_testset=0.0
+def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_MESURE= Intitial_Tx): #['angle', 'scale', 'translationX','translationY','shearX','shearY']
+        wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL)
+        return wrapped_img, Affine_mtrx, Affine_parameters
+
+Test_loss_sigma0 = test_loss(IR_Model_tst,testloader0,200, key = 'Affine_mtrx').detach().item()
+print(Test_loss_sigma0)
+json.dump( Test_loss_sigma0, open( file_savingfolder+'Test_loss_sigma{}.txt'.format(Noise_level_testset), 'w' ) )
+
+
+MSE_AffineMatrix_1measure = {}
+
+for MEASURE in Measures_list:
+    MEASURES= [MEASURE]#['angle', 'scale', 'translationX','translationY','shearX','shearY'] #['angle']#
+    def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_MESURE=MEASURES): 
+        wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL)
+        return wrapped_img, Affine_mtrx, Affine_parameters
+    #test_set = Dataset(list_paths=test_routes_source, batch_size=batch_size, DATASET=DATASET_generation,  mode='test')
+    #testloader = torch.utils.data.DataLoader(test_set, batch_size=batch_size,shuffle=False)
+    MSE_AffineMatrix_1measure[MEASURE] = test_loss(IR_Model_tst,testloader0,200, key = 'Affine_mtrx').detach().item()
+
+print(MSE_AffineMatrix_1measure)
+json.dump( MSE_AffineMatrix_1measure, open( file_savingfolder+'Test_loss_1Transformation.txt', 'w' ) )
+
+
+'''
+max_iterations=200
+eval_loss_tot = 0
+with torch.no_grad():
+    for i, data in enumerate(testloader, 0):
+        if i < max_iterations:
+            inputs, labels = data
+            inputs = move_dict2device(inputs,device)
+            labels = move_dict2device(labels,device)
+            #predections = IR_Model_tst(inputs)
+            eval_loss_tot += MSE_loss(labels['Affine_mtrx'], inputs['M_i']).detach()
+            eval_loss_avg = eval_loss_tot/i
+        else:
+            break
+'''
+
+
+#------------------------------------------------
+# Plotting deviation of the affine parameters [not accurate]
+
+Noise_level_testset=0.0
+def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_MESURE= Intitial_Tx): #['angle', 'scale', 'translationX','translationY','shearX','shearY']
+        wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL)
+        return wrapped_img, Affine_mtrx, Affine_parameters
+
+N_test_examples =300
+measurements_compare = {}
+for ls in Measures_list:
+    measurements_compare[ls] = torch.zeros(2,N_test_examples)
+
+for MEASURE in Measures_list:
+    MEASURES= [MEASURE]#['angle', 'scale', 'translationX','translationY','shearX','shearY'] #['angle']#
+    #test_set0 = Dataset(list_paths=test_routes_source, batch_size=batch_size, DATASET=DATASET_generation,
+    #        registration_method =registration_method,folder_suffix = folder_suffix, mode='test')
+    #tesloader0 = torch.utils.data.DataLoader(test_set0, batch_size=batch_size,shuffle=False)
+    dataiter = iter(testloader0)
+    with torch.no_grad():
+        for k in range(N_test_examples//batch_size):
+            inputs, labels  = next(dataiter)
+            inputs = move_dict2device(inputs,device)
+            labels = move_dict2device(labels,device)
+            predections = IR_Model_tst(inputs)
+            measurements_compare[MEASURE][0,k*batch_size:(k+1)*batch_size] =  Affine_mtrx2parameters(labels['Affine_mtrx'])[:, txt2num[MEASURE]]
+            measurements_compare[MEASURE][1,k*batch_size:(k+1)*batch_size]  = Affine_mtrx2parameters(predections['Affine_mtrx'])[:, txt2num[MEASURE]]
+
+def clip(x, x_min=torch.tensor(-1), x_max=torch.tensor(2)):
+    return torch.max(torch.min(x, x_max), x_min)
+
+for ls in Measures_list:
+    plt.plot([0,1], [0,1])
+    plt.scatter(measurements_compare[ls][0,:], 
+                clip(measurements_compare[ls][1,:],torch.tensor(-1),torch.tensor(2)), alpha = 0.2, cmap='viridis')
+    plt.title(ls)
+    plt.xlabel("ground-truth")
+    plt.ylabel("prediction")
+    #plt.legend([str(d) for d in range(N_recurences+1)],loc='upper left')
+    plt.savefig(file_savingfolder+ls+'.png')
+    plt.close()
+
+#------------------------------------------------
+# MSE_Affine Parameters 1measure
+
+def eval_AP_loss(loader, max_iterations=100):
+    eval_loss_tot = 0
+    with torch.no_grad():
+        for i, data in enumerate(loader, 0):
+            if i < max_iterations:
+                inputs, labels = data
+                inputs = move_dict2device(inputs,device)
+                labels = move_dict2device(labels,device)
+                predections = IR_Model_tst(inputs)
+                eval_loss_tot += MSE_loss(Affine_mtrx2parameters(labels['Affine_mtrx'])[:, txt2num[MEASURE]], Affine_mtrx2parameters(predections['Affine_mtrx'].detach())[:, txt2num[MEASURE]] )
+                eval_loss_avg = eval_loss_tot/i
+            else :
+                return eval_loss_avg
+    return eval_loss_avg
+
+Affine_parameters_1measure = {}
+
+for MEASURE in Measures_list:
+    # Affine_parameters
+    MEASURES= [MEASURE]#['angle', 'scale', 'translationX','translationY','shearX','shearY'] #['angle']#
+    def augment_img(image0, NOISE_LEVEL=0, MODE='bilinear', ONE_MESURE=MEASURES): 
+        wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL)
+        return wrapped_img, Affine_mtrx, Affine_parameters
+    Affine_parameters_1measure[MEASURE] = eval_AP_loss(testloader,200).detach().item()
+
+print(Affine_parameters_1measure)
+json.dump( Affine_parameters_1measure, open( file_savingfolder+'Test_loss_Affine_parameters_1measure.txt', 'w' ) )
+
+{'angle': 0.103, 'scale': 0.246, 'translationX': 0.039, 'translationY': 0.036, 'shearX': 245797, 'shearY': 160380}
+
+##------------------------------------------------------------------
+
+
+'''
+key = 'Affine_mtrx'
+max_iterations=10
+No_recurences = 10
+eval_loss_tot = {}
+eval_loss_avg = {}
+for j in range(No_recurences):
+    eval_loss_tot[str(j)]=0
+    with torch.no_grad():
+        for i, data in enumerate(testloader, 0):
+            if i < max_iterations:
+                inputs, labels = data
+                inputs = move_dict2device(inputs,device)
+                labels = move_dict2device(labels,device)
+                predections = IR_Model_tst(inputs)
+                eval_loss_tot[str(0)] += MSE_loss(labels[key], predections[key])
+                for j in range(1, No_recurences):
+                    inputs_j ={'source': inputs['source'],
+                                'target': inputs['target'],
+                                'M_i': predections['Affine_mtrx'].detach()}
+                    predections = IR_Model_tst(inputs_j)
+                    eval_loss_tot[str(j)] += MSE_loss(labels[key].detach(), predections[key].detach()).item()
+            else :
+                for j in range(No_recurences):
+                    eval_loss_avg[str(j)] = eval_loss_tot[str(j)]/max_iterations
+'''
+
+
+
+##------------------------------------------------------------------
+## Old Recurrent registration
+##------------------------------------------------------------------
+
+
+N_recurences = 3
+
+Measures_list =['MSE[I]','NCC[I]']
+avg_measure = {}
+total_measurex = {}
+
+for recurence in range(N_recurences):
+    avg_measure[str(recurence)] = {}
+    total_measurex[str(recurence)] = {}
+    for ls in Measures_list:
+        total_measurex[str(recurence)][ls] = 0.0
+        avg_measure[str(recurence)][ls] = 0.0
+
+pred_evolution ={}
+with torch.no_grad():
+    for i, data in enumerate(testloader, 0):
+        if i>1:
+            inputs, labels = data            
+            for recurence in range(N_recurences):
+                pred = IR_Model_tst(inputs)
+                pred_evolution[str(recurence)]= pred
+                inputs['source']= 0
+                inputs['source'] = pred['wrapped'].detach()
+                measure_val = {}
+                measure_val['MSE[I]'] = MSE_loss(labels['target'], pred['wrapped'])
+                measure_val['NCC[I]'] = NCC_loss(labels['target'], pred['wrapped'])
+                for ls in Measures_list:
+                    try: total_measurex[str(recurence)][ls] += measure_val[ls].item()
+                    except: total_measurex[str(recurence)][ls] += measure_val[ls]
+            if i%10 ==0:
+                for ls in Measures_list:
+                    txt=''
+                    for recurence in range(N_recurences):
+                        txt += '{}v{}: {} --  '.format(ls,recurence,np.round(total_measurex[str(recurence)][ls]/i,3))
+                    print(txt)
+                    
+    for recurence in range(N_recurences):
+        for ls in Measures_list:
+            avg_measure[str(recurence)][ls] = total_measurex[ls]/i
+
+
+
+'''
+dataiter = iter(valloader)
+X_batch, Y_batch = next(dataiter)
+
+def save_examples(IR_Model, dataloader , n_examples = 10):
+    with torch.no_grad():
+        dataiter = iter(dataloader)
+        X_batch, Y_batch = next(dataiter)
+        X_batch = move_dict2device(X_batch,device)
+        #Y_batch = move_dict2device(Y_batch,device)
+        pred = IR_Model(X_batch)
+        Affine_mtrx = pred['Affine_mtrx']
+        source = X_batch['source'].to(device)
+        target = X_batch['target'].to(device)
+        wrapped_img = wrap_imge(Affine_mtrx, source)
+        for k in range(n_examples):
+            if registration_method=='matching_points':
+                P1x = [dim*XY_source[k,0,0], dim*XY_target[k,0,0]]
+                P1y = [dim*XY_source[k,1,0], dim*(1+XY_target[k,1,0])]
+                P2x = [dim*XY_source[k,0,1], dim*XY_target[k,0,1]]
+                P2y = [dim*XY_source[k,1,1], dim*(1+XY_target[k,1,1])]
+                P3x = [dim*XY_source[k,0,2], dim*XY_target[k,0,2]]
+                P3y = [dim*XY_source[k,1,2], dim*(1+XY_target[k,1,2])]
+                plt.plot(P1x,P1y,P2x,P2y,P3x,P3y, color ='white',marker='x', linewidth = 2)
+                plt.plot(P1x,P1y, color ='white',marker='x', linewidth = 2)
+                plt.plot(P2x,P2y, color ='white',marker='o', linewidth = 2)
+                plt.plot(P3x,P3y, color ='white',marker='s', linewidth = 2)
+                plt.imshow(concatenated_PILimages)
+                plt.savefig(file_savingfolder+'tst.png', bbox_inches='tight')
+                plt.close()
+            else:
+                concatenated_images = torch.cat((source[k],target[k],wrapped_img[k]), dim =2 )
+                concatenated_PILimages = torchvision.transforms.ToPILImage()(concatenated_images)
+                concatenated_PILimages.save(file_savingfolder+'MIRexamples/{}.jpeg'.format(k))
+
+dataiter = iter(dataloader)
+X_batch, Y_batch = next(dataiter)
+
+
+X_batch = move_dict2device(X_batch,device)
+#Y_batch = move_dict2device(Y_batch,device)
+pred = IR_Model(X_batch)
+Affine_mtrx = pred['Affine_mtrx']
+XY_target = pred['XY_target']
+XY_source = pred['XY_source']
+
+source = X_batch['source'].to(device)
+target = X_batch['target'].to(device)
+
+
+y1 = [XY_source[k,0,0], XY_source[k,0,1]]
+
+
+k=0
+concatenated_images = torch.cat((source[k],target[k],wrapped_img[k]), dim =2 )
+concatenated_PILimages = torchvision.transforms.ToPILImage()(concatenated_images)
+concatenated_images = X_batch
+
+
+P1x = [dim*XY_source[k,0,0], dim*XY_target[k,0,0]]
+P1y = [dim*XY_source[k,1,0], dim*(1+XY_target[k,1,0])]
+P2x = [dim*XY_source[k,0,1], dim*XY_target[k,0,1]]
+P2y = [dim*XY_source[k,1,1], dim*(1+XY_target[k,1,1])]
+P3x = [dim*XY_source[k,0,2], dim*XY_target[k,0,2]]
+P3y = [dim*XY_source[k,1,2], dim*(1+XY_target[k,1,2])]
+plt.plot(P1x,P1y,P2x,P2y,P3x,P3y, color ='white',marker='x', linewidth = 2)
+plt.plot(P1x,P1y, color ='white',marker='x', linewidth = 2)
+plt.plot(P2x,P2y, color ='white',marker='o', linewidth = 2)
+plt.plot(P3x,P3y, color ='white',marker='s', linewidth = 2)
+plt.imshow(concatenated_PILimages)
+plt.savefig(file_savingfolder+'tst.png', bbox_inches='tight')
+plt.close()
+
+wrapped_img = wrap_imge(Affine_mtrx, source)
+for k in range(n_examples):
+    concatenated_images = torch.cat((source[k],target[k],wrapped_img[k]), dim =2 )
+    concatenated_PILimages = torchvision.transforms.ToPILImage()(concatenated_images)
+    concatenated_PILimages.save(file_savingfolder+'MIRexamples/{}.jpeg'.format(k))
+'''
+
+'''
+valloader = torch.utils.data.DataLoader(val_set, batch_size=batch_size,num_workers=4,shuffle=False)
+dataiter = iter(valloader)
+T={}
+for n in range(10):
+    T[str(n)] = 0
+
+max_i = 100
+ind = 0
+T_s = 0
+start0 = time.time()
+end0 = time.time()
+#for inputs, labels in valloader:
+for ind in range(max_i):
+    #ind +=1
+    #if ind> max_i:
+    #    break
+    #--------------------------
+    #time.sleep(0.2)
+    start1 = time.time()
+    inputs, labels = next(dataiter)
+    time.sleep(0.1)
+    T['1'] += ((time.time()-start1)*10**3)/max_i
+    #--------------------------
+    start7 = time.time()
+    labels = labels.to(device)
+    T['7'] += ((time.time()-start7)*10**3)/max_i
+    start8 = time.time()
+    inputs = inputs.to(device)
+    T['8'] += ((time.time()-start8)*10**3)/max_i
+    #--------------------------
+    start2 = time.time()
+    optimizer.zero_grad()
+    T['2'] += ((time.time()-start2)*10**3)/max_i
+    #--------------------------
+    #time.sleep(0.2)
+    start3 = time.time()        
+    predections = IR_Model(inputs)
+    #time.sleep(0.05)
+    T['3'] += ((time.time()-start3)*10**3)/max_i
+    #--------------------------
+    start4 = time.time()
+    loss = MSE_loss(labels, predections)
+    T['4'] += ((time.time()-start4)*10**3)/max_i
+    #--------------------------
+    #time.sleep(0.2)
+    start5 = time.time()
+    loss.backward()
+    #time.sleep(0.2)
+    T['5'] += ((time.time()-start5)*10**3)/max_i
+    #--------------------------
+    start6 = time.time()
+    optimizer.step()
+    T['6'] += ((time.time()-start6)*10**3)/max_i
+    T['9'] += ((time.time()-end0)*10**3)/max_i
+    end0 = time.time()
+
+T['0'] += ((time.time()-start0)*10**3)/max_i
+T['0']
+'''
+
+
+
+# Old models
+# -----------------------------------------
+
+
+
+#DINO
+#----------------------------------------------------------
+
+if registration_method=='recurrent_matrix':
+    matrix_size = 1
+else:
+    matrix_size = 0
+
+DINO_transform = transforms.Compose([transforms.Resize(size=(14*16 - matrix_size,14*16 ), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
+                    transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),])
+
+class Build_IRmodel_DINO(nn.Module):
+    def __init__(self, DINO_model,registration_method = 'affine matrix'):
+        super(Build_IRmodel_DINO, self).__init__()
+        self.DINO_model = DINO_model
+        self.registration_method = registration_method
+        if registration_method=='matching_points':
+            self.N_parameters = 18
+        else:
+            self.N_parameters = 6
+        #self.N_parameters = N_parameters
+        #self.device = device
+        self.conv3 = nn.Conv2d(3, 3, kernel_size=14, padding='same', stride = 1)
+        self.activation = nn.ELU()
+        #self.global_avg_pooling = nn.AdaptiveAvgPool2d(10)
+        self.fc1 =nn.Linear(6, 64)
+        self.fc2 =nn.Linear(64, 128*3)
+        self.fc3 =nn.Linear(384, 384)
+        self.fc4 =nn.Linear(384, self.N_parameters)
+    def forward(self, concatenated_input):
+        source = input_X_batch['source']
+        target = input_X_batch['target']
+        concatenated_images = torch.cat((source,target), dim=2)
+        concatenated_images = DINO_transform(concatenated_images)
+        if self.registration_method=='recurrent_matrix':
+            M_i = input_X_batch['M_i'].view(-1, 6)
+            #-------------------------------------
+            M_rep = F.relu(self.fc1(M_i))
+            M_rep = F.relu(self.fc2(M_rep)).view(-1,3,1,128)
+            #-------------------------------------
+            concatenated_input = torch.cat((concatenated_images,M_rep), dim=2)
+        else:
+            concatenated_input = torch.cat((source,target), dim=2)
+        #X = torch.zeros([batch_size, 3, 288, 200])
+        #X[:, :, 16: 272, 36:164] = concatenated_input
+        Tx_inputs = DINO_transform(concatenated_input)
+        DINO_inputs = self.conv3(Tx_inputs)
+        VTX_output = self.DINO_model(DINO_inputs)
+        #x = self.global_avg_pooling(Unet_output)
+        #x = torch.flatten(x, 1) # flatten all dimensions except batch
+        x = VTX_output
+        x = F.relu(self.fc3(x))
+        predicted_line = self.fc4(x)
+        if self.registration_method=='matching_points':
+            predcited_points = predicted_line.view(-1, 2, 3, 3)
+            XY_source = predcited_points[:,1,:,:]
+            XY_source[:,2,:] = 1.
+            XY_target = predcited_points[:,0,0:2,:]
+            Affine_mtrx = torch.matmul(XY_target, torch.linalg.inv(XY_source)) 
+            predction = {'Affine_mtrx': Affine_mtrx,
+                        'XY_source':XY_source,
+                       'XY_target':XY_target, }
+        elif self.registration_method=='recurrent_matrix':
+            predicted_mtrx = predicted_line.view(-1, 2, 3)
+            Affine_mtrx = predicted_mtrx + input_X_batch['M_i']
+            predction = {'predicted_mtrx':predicted_mtrx,
+                            'Affine_mtrx': Affine_mtrx}
+        else:
+            Affine_mtrx = predicted_line.view(-1, 2, 3)
+            predction = {'Affine_mtrx': Affine_mtrx}#{'wrapped': wrapped_img,'Affine_mtrx': Affine_mtrx}
+        return predction
+
+
+if Arch == 'DINO':
+    core_model = torch.hub.load(repo_or_dir="facebookresearch/dinov2", model="dinov2_vits14")
+    count =0
+    for param in core_model.parameters():
+        count+=1
+        if count>1 and count<173:
+            param.requires_grad = False
+            
+    IR_Model = Build_IRmodel_DINO(core_model,registration_method )
+    core_model.to(device)
+    IR_Model.to(device)
+
+
+
+#ViT
+#----------------------------------------------------------
+if registration_method=='recurrent_matrix':
+    matrix_size = 1
+else:
+    matrix_size = 0
+
+VTX_scale = torchvision.transforms.Resize([224-matrix_size,224], antialias=False)
+class Build_IRmodel_VTX(nn.Module):
+    def __init__(self, VTX_model,registration_method = 'affine matrix'):
+        super(Build_IRmodel_VTX, self).__init__()
+        self.VTX_model = VTX_model
+        self.registration_method = registration_method
+        if registration_method=='matching_points':
+            self.N_parameters = 18
+        else:
+            self.N_parameters = 6
+        #self.N_parameters = N_parameters
+        #self.device = device
+        #self.global_avg_pooling = nn.AdaptiveAvgPool2d(10)
+        self.fc1 =nn.Linear(6, 64)
+        self.fc2 =nn.Linear(64, 128*3)
+        self.fc3 =nn.Linear(768, 768)
+        self.fc4 =nn.Linear(768, self.N_parameters)
+    def forward(self, concatenated_input):
+        source = input_X_batch['source']
+        target = input_X_batch['target']
+        concatenated_images = torch.cat((source,target), dim=2)
+        concatenated_images = DINO_transform(concatenated_images)
+        if self.registration_method=='recurrent_matrix':
+            M_i = input_X_batch['M_i'].view(-1, 6)
+            #-------------------------------------
+            M_rep = F.relu(self.fc1(M_i))
+            M_rep = F.relu(self.fc2(M_rep)).view(-1,3,1,128)
+            #-------------------------------------
+            concatenated_input = torch.cat((concatenated_images,M_rep), dim=2)
+        else:
+            concatenated_input = torch.cat((source,target), dim=2)
+        #X = torch.zeros([batch_size, 3, 288, 200])
+        #X[:, :, 16: 272, 36:164] = concatenated_input
+        VTX_inputs = VTX_scale(concatenated_input)
+        VTX_output = self.VTX_model(VTX_inputs)
+        #x = self.global_avg_pooling(Unet_output)
+        #x = torch.flatten(x, 1) # flatten all dimensions except batch
+        x = VTX_output
+        #x = F.relu(self.fc1(x))
+        x = F.relu(self.fc3(x))
+        predicted_line = self.fc4(x)
+        if self.registration_method=='matching_points':
+            predcited_points = predicted_line.view(-1, 2, 3, 3)
+            XY_source = predcited_points[:,1,:,:]
+            XY_source[:,2,:] = 1.
+            XY_target = predcited_points[:,0,0:2,:]
+            Affine_mtrx = torch.matmul(XY_target, torch.linalg.inv(XY_source)) 
+            predction = {'Affine_mtrx': Affine_mtrx,
+                        'XY_source':XY_source,
+                       'XY_target':XY_target, }
+        elif self.registration_method=='recurrent_matrix':
+            predicted_mtrx = predicted_line.view(-1, 2, 3)
+            Affine_mtrx = predicted_mtrx + input_X_batch['M_i']
+            predction = {'predicted_mtrx':predicted_mtrx,
+                            'Affine_mtrx': Affine_mtrx}
+        else:
+            Affine_mtrx = predicted_line.view(-1, 2, 3)
+            predction = {'Affine_mtrx': Affine_mtrx}#{'wrapped': wrapped_img,'Affine_mtrx': Affine_mtrx}
+        return predction
+
+
+from torchvision.models import vit_b_16
+if Arch == 'VTX':
+    core_model = vit_b_16(pretrained=True)
+    count =0
+    for param in core_model.parameters():
+        count+=1
+        if count>1:
+            param.requires_grad = False
+    core_model.heads.head = Identity()
+    IR_Model = Build_IRmodel_VTX(core_model,registration_method )
+    core_model.to(device)
+    IR_Model.to(device)
+
+
+
+## U-Net
+#----------------------------------------------------------
+
+class conv_block(nn.Module):
+  def __init__(self, in_c, out_c):
+    super().__init__()
+    self.conv1 = nn.Conv2d(in_c, out_c, kernel_size=3, padding=1)
+    self.bn1 = nn.BatchNorm2d(out_c)
+    self.conv2 = nn.Conv2d(out_c, out_c, kernel_size=3, padding=1)
+    self.bn2 = nn.BatchNorm2d(out_c)
+    self.relu = nn.ReLU()
+  def forward(self, inputs):
+    x = self.conv1(inputs)
+    x = self.bn1(x)
+    x = self.relu(x)
+    x = self.conv2(x)
+    x = self.bn2(x)
+    x = self.relu(x)
+    return x
+
+class encoder_block(nn.Module):
+  def __init__(self, in_c, out_c):
+    super().__init__()
+    self.conv = conv_block(in_c, out_c)
+    self.pool = nn.MaxPool2d((2, 2))
+  def forward(self, inputs):
+    x = self.conv(inputs)
+    p = self.pool(x)
+    return x, p
+
+class decoder_block(nn.Module):
+  def __init__(self, in_c, out_c):
+    super().__init__()
+    self.up = nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2, padding=0)
+    self.conv = conv_block(out_c+out_c, out_c)
+  def forward(self, inputs, skip):
+    x = self.up(inputs)
+    x = torch.cat([x, skip], axis=1)
+    x = self.conv(x)
+    return x
+
+class build_unet(nn.Module):
+  def __init__(self, dim=128):
+    super().__init__()
+    self.dim = dim
+    #self.layer_norm = torch.nn.LayerNorm([6, dim, dim])
+    self.e1 = encoder_block(3, 32)
+    self.e2 = encoder_block(32, 64)
+    self.e3 = encoder_block(64, dim)
+    self.b = conv_block(dim, dim)
+    self.d1 = decoder_block(dim, dim)
+    self.d2 = decoder_block(dim, 64)
+    self.d3 = decoder_block(64, 32)
+    self.outputs = nn.Conv2d(32, 2, kernel_size=5,stride = 2, padding=0)
+  def forward(self, inputs):
+    #inputs = self.layer_norm(inputs)
+    s1, p1 = self.e1(inputs)
+    s2, p2 = self.e2(p1)
+    s3, p3 = self.e3(p2)
+    b = self.b(p3)
+    d1 = self.d1(b, s3)
+    d2 = self.d2(d1, s2)
+    d3 = self.d3(d2, s1)
+    outputs = self.outputs(d3)
+    return outputs
+
+class Build_IRmodel_AE(nn.Module):
+    def __init__(self, unet,registration_method = 'affine matrix'):
+        super(Build_IRmodel_AE, self).__init__()
+        self.unet = unet
+        if registration_method=='matching_points':
+            self.N_parameters = 18
+        else:
+            self.N_parameters = 6
+        #self.N_parameters = N_parameters
+        #self.device = device
+        self.global_avg_pooling = nn.AdaptiveAvgPool2d(10)
+        self.fc1 =nn.Linear(6, 64)
+        self.fc2 =nn.Linear(64, 128*3)
+        self.fc3 =nn.Linear(2*10*10, 100)
+        self.fc4 =nn.Linear(100, 100)
+        self.fc5 =nn.Linear(100, self.N_parameters)
+    def forward(self, concatenated_input):
+        source = input_X_batch['source']
+        target = input_X_batch['target']
+        if self.registration_method=='recurrent_matrix':
+            M_i = input_X_batch['M_i'].view(-1, 6)
+            #-------------------------------------
+            M_rep = F.relu(self.fc1(M_i))
+            M_rep = F.relu(self.fc2(M_rep)).view(-1,3,1,128)
+            #-------------------------------------
+            concatenated_input = torch.cat((source,target,M_rep), dim=2)
+        else:
+            concatenated_input = torch.cat((source,target), dim=1)
+        Unet_output = self.unet(concatenated_input)
+        x = self.global_avg_pooling(Unet_output)
+        x = torch.flatten(x, 1) # flatten all dimensions except batch
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        predicted_line = self.fc5(x)
+        if self.registration_method=='matching_points':
+            predcited_points = predicted_line.view(-1, 2, 3, 3)
+            XY_source = predcited_points[:,1,:,:]
+            XY_source[:,2,:] = 1.
+            XY_target = predcited_points[:,0,0:2,:]
+            Affine_mtrx = torch.matmul(XY_target, torch.linalg.inv(XY_source)) 
+            predction = {'Affine_mtrx': Affine_mtrx,
+                        'XY_source':XY_source,
+                        'XY_target':XY_target, }
+        elif self.registration_method=='recurrent_matrix':
+            predicted_mtrx = predicted_line.view(-1, 2, 3)
+            Affine_mtrx = predicted_mtrx + input_X_batch['M_i']
+            predction = {'predicted_mtrx':predicted_mtrx,
+                            'Affine_mtrx': Affine_mtrx}
+        else:
+            Affine_mtrx = predicted_line.view(-1, 2, 3)
+            predction = {'Affine_mtrx': Affine_mtrx}
+        return predction
+
+if Arch == 'U-Net':
+    core_model = build_unet(dim = dim)
+    IR_Model = Build_IRmodel_AE(core_model, registration_method)
+    core_model.to(device)
+    IR_Model.to(device)
+
+
+## CNN
+#----------------------------------------------------------
+
+class Build_IRmodel_CNN(nn.Module):
+    def __init__(self, registration_method = 'affine matrix'):
+      super(Build_IRmodel_CNN, self).__init__()
+      if registration_method=='matching_points':
+            self.N_parameters = 18
+        else:
+            self.N_parameters = 6
+      self.registration_method = registration_method   
+      self.conv1 = nn.Conv2d(6, 128, kernel_size=7,stride = 4, padding=3)
+      self.conv2 = nn.Conv2d(128, 256, kernel_size=5,stride = 3, padding=3)
+      self.conv3 = nn.Conv2d(256, 512, kernel_size=5,stride = 3, padding=1)
+      self.conv4 = nn.Conv2d(512, 512, kernel_size=3,stride = 2, padding=1)
+      self.bn1 = nn.BatchNorm2d(128)
+      self.bn2 = nn.BatchNorm2d(256)
+      self.bn3 = nn.BatchNorm2d(512)
+      self.relu = nn.ReLU()
+      self.activation = nn.ELU()
+      self.mxpool = nn.MaxPool2d(3)
+      self.global_avg_pooling = nn.AdaptiveAvgPool2d(10)
+      self.fc1 =nn.Linear(6, 64)
+      self.fc2 =nn.Linear(64, 128*3)
+      self.fc3 =nn.Linear(512, self.N_parameters)
+      self.fc4 =nn.Linear(512, 100)
+      self.fc5 =nn.Linear(100, 100)
+      self.fc6 =nn.Linear(100, self.N_parameters)
+    def forward(self, inputs):
+      source = input_X_batch['source']
+      target = input_X_batch['target']
+      if self.registration_method=='recurrent_matrix':
+        M_i = input_X_batch['M_i'].view(-1, 6)
+        #-------------------------------------
+        M_rep = F.relu(self.fc1(M_i))
+        M_rep = F.relu(self.fc2(M_rep)).view(-1,3,1,128)
+        #-------------------------------------
+        concatenated_input = torch.cat((source,target,M_rep), dim=2)
+      else:
+        concatenated_input = torch.cat((source,target), dim=2)
+      cn1 = self.activation(self.bn1(self.conv1(concatenated_input)))
+      cn2 = self.activation(self.bn2(self.conv2(cn1)))
+      cn3 = self.activation(self.conv3(cn2))
+      cn3 = self.mxpool(cn3)
+      cn4 = self.activation(self.bn3(self.conv4(cn3)))
+      cn4 = self.activation(self.conv4(cn3))
+      cn_output = cn4
+      #predction = cn4
+      x = torch.flatten(cn_output, 1)
+      x = self.activation(self.fc4(x))
+      x = self.activation(self.fc5(x))
+      predicted_line = self.fc6(x)
+      if self.registration_method=='Rawblock':
+       Affine_mtrx = predicted_line.view(-1, 2, 3)
+       Affine_parameters = Affine_mtrxline2parameters(predicted_line)
+      elif self.registration_method=='matching_points':
+       predcited_points = predicted_line.view(-1, 2, 3, 3)
+       XY_source = predcited_points[:,1,:,:]
+       XY_source[:,2,:] = 1.
+       XY_target = predcited_points[:,0,0:2,:]
+       Affine_mtrx = torch.matmul(XY_target, torch.linalg.inv(XY_source))  
+       predction = {'Affine_mtrx': Affine_mtrx,
+                        'XY_source':XY_source,
+                        'XY_target':XY_target, }       
+      elif self.registration_method=='recurrent_matrix':
+            predicted_mtrx = predicted_line.view(-1, 2, 3)
+            Affine_mtrx = predicted_mtrx + input_X_batch['M_i']
+            predction = {'predicted_mtrx':predicted_mtrx,'Affine_mtrx': Affine_mtrx}
+      else:
+       Affine_parameters = predicted_line
+       Affine_mtrx = normalizedparameterline2Affine_matrx(predicted_line, device , Noise_level=0.0)#Affine_matrx_from_line(predicted_line)
+       predction = {'Affine_mtrx': Affine_mtrx,'Affine_parameters': Affine_parameters}
+      return predction
+
+if Arch == 'cnn':
+    IR_Model = Build_IRmodel_CNN(registration_method)
+    IR_Model.to(device)
+
+'''
+elif Arch == 'cnn':
+    IR_Model = Build_IRmodel_CNN(registration_method)
+elif Arch == 'VTX':
+    core_model_tst = vit_b_16(pretrained=True)
+    core_model_tst.fc = Identity()
+    core_model_tst.load_state_dict(torch.load(file_savingfolder+'core_model'+ext+'.pth'))
+    core_model_tst.to(device)
+    IR_Model_tst = Build_IRmodel_VTX(core_model_tst,registration_method)
+elif Arch == 'U_net' or Arch == 'AE':
+    core_model_tst = build_unet(dim = dim)
+    core_model_tst.load_state_dict(torch.load(file_savingfolder+'core_model'+ext+'.pth'))
+    core_model_tst.to(device)
+    IR_Model_tst = Build_IRmodel_AE(core_model_tst, NN_Output, N_parameters)
+'''
+
+
+#----------------------------------------------------------
+
+
+'''
+def wrap_imge0(Affine_mtrx, source_img):
+    #This function does not produce accurate grid.
+    grd = torch.nn.functional.affine_grid(Affine_mtrx, size=source_img.shape,align_corners=False)
+    wrapped_img = torch.nn.functional.grid_sample(source_img, grid=grd,
+                                                  mode='bilinear', padding_mode='zeros', align_corners=False)
+    return wrapped_img
+'''
