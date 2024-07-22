@@ -11,7 +11,7 @@ apple/mobilevitv2-1.0-imagenet1k-256
 apple/coreml-FastViT-T8
 apple/mobilevitv2-1.0-voc-deeplabv3
 '''
-#conda actiavet Tx
+#conda activate Tx
 
 #----------------------------------------------------------------
 import os, sys
@@ -39,47 +39,31 @@ import transformers
 
 
 HPC = False
+SM1 = True #SM1 server
 device_num = 1
 torch.cuda.set_device(device_num)
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 device_aug = 'cpu'#device#'cpu'
 
-Fine_tuned = True
+Fine_tuned = False
+with_Global_reference= True
 Curriculum_learning = False
+Avoid_trivial = True
 with_global_loss = True
-with_Cyclic_losses = True
+with_Cyclic_losses = False
 Active_learning = False
+with_Difficultyadj_loss = False
+include_loss_model1 = False
 Arch = 'mobileVIT'#{#'mobileVIT'#'rawVIT'#'ResNet''VTX', 'U-Net','ResNet', 'DINO' ,'rawVIT' }#'mobileVITwithMI'
 overlap='vertical' #'vertical' #'horizontal'
 registration_method = 'Rawblock'#'Additive_Recurence' #{'Additive_Recurence','Rawblock', 'matching_points', 'Additive_Recurence', 'Multiplicative_Recurence'} #'recurrent_matrix',
-Uniscale = True
+Uniscale = False
 with_scheduler = True
-IMG_noise = False
+IMG_noise = True
 SWITCH = False
 
-if Fine_tuned:
-    folder_suffix = 'FT2_'
-    if with_Cyclic_losses:
-        folder_suffix += 'cyclic_'
-    if with_global_loss:
-        folder_suffix += 'global_'
-else:
-    folder_suffix = 'tst'#'12Epochs'
-
-if Curriculum_learning:
-    folder_suffix += 'CurriculumL_'
-
-
-if Active_learning:
-    folder_suffix += 'ActiveL_'
-
-if Uniscale:
-    Intitial_Tx = ['angle', 'scale','scaleX','scaleY','translationX','translationY','shearX','shearY', 'reflectionX', 'reflectionY']
-else:
-    Intitial_Tx = ['angle', 'scaleX','scaleY','translationX','translationY','shearX','shearY', 'reflectionX', 'reflectionY'] #'scale'
-
 global Noise_level_dataset
-Noise_level_dataset=0.5
+Noise_level_dataset=0.1
 LYR_NORM = False
 Fix_Torch_Wrap = False
 BW_Position = False
@@ -89,6 +73,30 @@ BLOCK_MAX = 1
 dim = 128
 dim0 =224
 crop_ratio = dim/dim0
+
+if Fine_tuned:
+    folder_suffix = 'Tr_FT2_'
+    if with_Cyclic_losses:
+        folder_suffix += 'cyclic_'
+    if with_global_loss:
+        folder_suffix += 'global_'
+elif with_Global_reference:
+    folder_suffix = 'GR_'
+    if Avoid_trivial:
+        folder_suffix += 'NoTrivial_'
+else:
+    folder_suffix = 'tst'#'12Epochs'
+
+if Curriculum_learning:
+    folder_suffix += 'CurriculumL_'
+
+if Active_learning:
+    folder_suffix += 'ActiveL_'
+
+if Uniscale:
+    Intitial_Tx = ['angle', 'scale','scaleX','scaleY','translationX','translationY','shearX','shearY', 'reflectionX', 'reflectionY']
+else:
+    Intitial_Tx = ['angle', 'scaleX','scaleY','translationX','translationY','shearX','shearY', 'reflectionX', 'reflectionY'] #'scale'
 
 DATASET_generation_split = { 'train': 'active',
 'val': 'active',
@@ -104,12 +112,9 @@ if Fix_Torch_Wrap:
     Noise_level_dataset = 0.1
 elif SWITCH:
     Noise_level_dataset = 0.1
-else:
-    Noise_level_dataset = 0.5
 
 if SWITCH:
     folder_suffix += '_bidirectional_'
-
 
 if 'scale' in Intitial_Tx:
     folder_suffix += '_uniscale_'
@@ -118,11 +123,11 @@ if BW_Position:
     folder_suffix += '.BWPosition'
 
 if IMG_noise:
-    IMG_noise_level = 0.1
+    IMG_noise_level = 0.2
     batch_size = 128
     folder_suffix += 'ImgNoise{}_'.format(IMG_noise_level)
 else:
-    batch_size = 64
+    batch_size = 128
 
 if 'Recurence' in registration_method :
     folder_suffix += '.completely_random'#'random_aff_param'#'completely_random' #'scheduledrandom' #zero
@@ -160,7 +165,10 @@ else:
 if HPC:
     activedata_root = '/gpfs/projects/acad/maiaone/dataset/224/'
 else:
-    activedata_root ='../../localdb/224/'
+    if SM1:
+        activedata_root ='../../localdb/224/'
+    else:
+        activedata_root = '/home/ahmadh/imagenet-object-localization-challenge/ILSVRC/Data/Standard_Size/224/'
     import tqdm
 
 saveddata_root = 'False'
@@ -192,6 +200,580 @@ os.system('mkdir '+ file_savingfolder)
 
 ##-----------------------------------------
 ##---------------Gthms--------------------
+
+
+
+
+# we need to apply the augmentation to a batch of images instead of applying it to each image alone
+# Thus the augmentation will take place in the dataset
+
+import math
+Intitial_Tx = ['angle', 'scaleX','scaleY','translationX','translationY','shearX','shearY', 'reflection']
+
+class Dataset_source(torch.utils.data.Dataset):
+  def __init__(self, list_paths, mode, batch_size = 64):
+        self.list_paths = list_paths[mode]
+        self.dim = dim
+        self.batch_size = batch_size
+        self.number_examples = len(self.list_paths)
+  def __len__(self):
+        return int(self.batch_size*(self.number_examples // self.batch_size))
+  def __getitem__(self, index):
+        source_image_path = self.list_paths[index]
+        source_origion = load_image_pil_accelerated(source_image_path)
+        #X = {'source_origion':source_origion}
+        #Y = {'Affine_mtrx': 0}
+        return source_origion
+
+batch_size=80
+
+train_set = Dataset_source(list_paths=routes_source, mode='train', batch_size=batch_size)
+trainloader = torch.utils.data.DataLoader( train_set, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=1)
+#-------------
+val_set = Dataset_source(list_paths=routes_source, mode='val', batch_size=batch_size)
+valloader = torch.utils.data.DataLoader(val_set, batch_size=batch_size, pin_memory=True,shuffle=True, num_workers=4, )
+#-------------
+
+'''
+dim_start = (dim0 - dim)//2
+dim_end = dim_start+dim
+source = source_origion[:,:,dim_start:dim_end,dim_start:dim_end]
+'''
+
+# Center crop
+def center_crop(batch, dim = 128):
+    dim0 = batch.shape[-2]
+    dim_start = (dim0 - dim)//2
+    dim_end = dim_start+dim
+    batch_cropped = batch[:,:,dim_start:dim_end,dim_start:dim_end]
+    return batch_cropped
+
+def warp_batch(Affine_mtrx, source_imgs):
+    grd = torch.nn.functional.affine_grid(Affine_mtrx, size=source_imgs.shape,align_corners=False)
+    wrapped_imgs = torch.nn.functional.grid_sample(source_imgs, grid=grd,
+                                              mode='bilinear', padding_mode='zeros', align_corners=False)
+    return wrapped_imgs
+
+# Add illumination noise to the images
+def add_noise2batch(batch, sigma = IMG_noise_level, device='cpu'):
+    N_imgs = batch.shape[0]
+    batch_shape = batch.shape
+    selector = torch.rand(N_imgs)
+    gamma = torch.rand(N_imgs,1,1,1)
+    gamma[selector<0.5]= 0.3+ 0.8*gamma[selector<0.5]
+    gamma[selector>=0.5]= 1+ 4*gamma[selector>=0.5]
+    if device == 'cpu':
+        c = sigma*torch.randn(batch_shape)
+        batch_clipped = torch.clip(batch*(1 + c),0,1)
+        batch_adjusted0 = torch.pow(batch_clipped,gamma)
+    else:
+        c = sigma*torch.randn(batch_shape).to(device)
+        batch_clipped = torch.clip(batch*(1 + c),0,1)
+        batch_adjusted0 = torch.pow(batch_clipped.to(device),gamma.to(device))
+    batch_adjusted_clipped = torch.clip(batch_adjusted0,0,1)
+    return batch_adjusted_clipped
+
+
+def add_noise2AffineMatrix(Affine_batch0, sigma = 0.1):
+    batch_size = Affine_batch0.shape[0]
+    random_component = torch.normal(torch.zeros([batch_size,2,3]), sigma*torch.ones([batch_size,2,3]))
+    #truncate values that exceeds a threshold
+    random_component = torch.clamp(random_component, min=-3.0*sigma, max=3.0*sigma)
+    Affine_batch = Affine_batch0+ Affine_batch0*(random_component)
+    return Affine_batch
+
+def Batch_matrice_from_parameters(angles,scalesX,scalesY,shearsX,shearsY ,reflections ,translationsX,translationsY):
+    batch_size = angles.shape[0]
+    affine_matrices = torch.zeros(batch_size, 2, 3)
+    # Compute the rotation matrices
+    cos_angles = torch.cos(angles)
+    sin_angles = torch.sin(angles)
+    rotation_matrices = torch.stack([
+        torch.stack([cos_angles, -sin_angles], dim=1),
+        torch.stack([sin_angles, cos_angles], dim=1)], dim=1)
+    # Compute the scaling matrices
+    scaling_matrices = torch.zeros(batch_size, 2, 2)
+    scaling_matrices[:, 0, 0] = scalesX
+    scaling_matrices[:, 1, 1] = scalesY
+    # Compute the shearing matrices
+    shear_matrices = torch.ones(batch_size, 2, 2)
+    shear_matrices[:, 0, 1] = shearsX
+    shear_matrices[:, 1, 0] = shearsY
+    # Compute the reflection matrices
+    reflection_matrices = torch.zeros(batch_size, 2, 2)#torch.eye(2).repeat(batch_size, 1, 1)
+    reflection_matrices[:, 0, 0] = reflections[:, 0]
+    reflection_matrices[:, 1, 1] = reflections[:, 1]
+    # Combine transformations: scale -> shear -> rotate -> reflect
+    transform_matrices = torch.bmm(torch.bmm(torch.bmm(scaling_matrices, shear_matrices), rotation_matrices), reflection_matrices)
+    #transform_matrices = torch.bmm(torch.bmm(shear_matrices, torch.bmm(reflection_matrices, scaling_matrices)), rotation_matrices)
+    # Assign to affine matrices
+    affine_matrices[:, :2, :2] = transform_matrices
+    affine_matrices[:, 0, 2] = translationsX
+    affine_matrices[:, 1, 2] = translationsY
+    return affine_matrices
+
+def Generate_Affine_batch(batch_size):
+    angle_range = [-math.pi, math.pi]
+    scale_range = [0.2,1.8]
+    shear_range = [-0.5,0.5]
+    translation_range = [-0.25,0.25]
+    angles = sample_from_2distributions(angle_range, N_samples= batch_size, PivotPoint = 0)
+    scalesX = sample_from_2distributions(scale_range, N_samples= batch_size, PivotPoint = 1)
+    scalesY = sample_from_2distributions(scale_range, N_samples= batch_size, PivotPoint = 1)
+    shearsX = sample_from_2distributions(shear_range, N_samples= batch_size, PivotPoint = 0)
+    shearsY = sample_from_2distributions(shear_range, N_samples= batch_size, PivotPoint = 0)
+    translationsX = sample_from_2distributions(translation_range, N_samples= batch_size, PivotPoint = 0)
+    translationsY = sample_from_2distributions(translation_range, N_samples= batch_size, PivotPoint = 0)
+    reflections = 2*reflections_dist.sample((batch_size, 2))-1
+    affine_matrices = Batch_matrice_from_parameters(angles,scalesX,scalesY,shearsX,shearsY,reflections,translationsX,translationsY)
+    return affine_matrices
+
+def Generate_Affine_batch_selecTx(batch_size, Tx = Intitial_Tx, Uniscale=False):
+    angle_range = [-math.pi, math.pi]
+    scale_range = [0.2,1.8]
+    shear_range = [-0.5,0.5]
+    translation_range = [-0.25,0.25]
+    if 'angle' in Tx:
+        angles = sample_from_2distributions(angle_range, N_samples= batch_size, PivotPoint = 0)
+    else:
+        angles = torch.zeros(batch_size)
+    if 'scaleX' in Tx:
+        scalesX = sample_from_2distributions(scale_range, N_samples= batch_size, PivotPoint = 1)
+    else:
+        scalesX = torch.ones(batch_size)
+    if 'scaleY' in Tx:
+        if Uniscale:
+            scalesY = scalesX
+        else:
+            scalesY = sample_from_2distributions(scale_range, N_samples= batch_size, PivotPoint = 1)
+    else:
+        scalesY = torch.ones(batch_size)
+    if 'shearX' in Tx:
+        shearsX = sample_from_2distributions(shear_range, N_samples= batch_size, PivotPoint = 0)
+    else:
+        shearsX = torch.zeros(batch_size)
+    if 'shearY' in Tx:
+        shearsY = sample_from_2distributions(shear_range, N_samples= batch_size, PivotPoint = 0)
+    else:
+        shearsY = torch.zeros(batch_size)
+    if 'shearX' in Tx:
+        translationsX = sample_from_2distributions(translation_range, N_samples= batch_size, PivotPoint = 0)
+    else:
+        translationsX = torch.zeros(batch_size)
+    if 'shearY' in Tx:
+        translationsY = sample_from_2distributions(translation_range, N_samples= batch_size, PivotPoint = 0)
+    else:
+        translationsY = torch.zeros(batch_size)
+    if 'reflection' in Tx:
+        reflections = 2*reflections_dist.sample((batch_size, 2))-1
+    else:
+        reflections = torch.ones(batch_size, 2)
+    affine_matrices = Batch_matrice_from_parameters(angles,scalesX,scalesY,shearsX,shearsY,reflections,translationsX,translationsY)
+    return affine_matrices
+
+DIFFICULTY_MIN =0.0
+DIFFICULTY_MAX = 1.0
+prob_flip = 0.5*(DIFFICULTY_MAX+DIFFICULTY_MIN)
+reflections_dist = torch.distributions.Categorical(torch.tensor([prob_flip, 1-prob_flip]))
+
+def sample_from_2distributions(dist_range, N_samples= batch_size, PivotPoint = 0, difficulty_min = DIFFICULTY_MIN, difficulty_max =DIFFICULTY_MAX):
+    N_samplesFromDistribution1 = random.randint(0, N_samples)
+    N_samplesFromDistribution2 = N_samples - N_samplesFromDistribution1
+    region1_min = PivotPoint - difficulty_max*(abs(PivotPoint-dist_range[0]))
+    region1_max = PivotPoint - difficulty_min*(abs(PivotPoint-dist_range[0]))
+    region2_min = PivotPoint + difficulty_min*(abs(dist_range[1]-PivotPoint))
+    region2_max = PivotPoint + difficulty_max*(abs(dist_range[1]-PivotPoint))
+    samples = torch.cat([ torch.FloatTensor(N_samplesFromDistribution1).uniform_(region1_min, region1_max),
+                        torch.FloatTensor(N_samplesFromDistribution2).uniform_(region2_min, region2_max) ])
+    return samples
+
+
+
+#Read Images
+
+'''
+dataiter = iter(valloader)
+source_origion = next(dataiter)
+
+# Generate affine matrices [0.3 min/epoch]
+Affine_batch = Generate_Affine_batch(batch_size)
+
+if Affine_noise_intensity>0:
+    Affine_batch = add_noise2AffineMatrix(Affine_batch, sigma = Affine_noise_intensity)
+
+source_origion = source_origion.to(device)
+Affine_batch = Affine_batch.to(device)
+
+#source_origion = X_batch['source_origion']
+warped_img_dim0 = warp_batch(Affine_batch, source_origion) # 9 min/epoch on CPU, <1min on GPU
+target = center_crop(warped_img_dim0, dim = 128)
+
+if IMG_noise_level>0: ## 90 min/epoch on CPU, 60min on GPU
+    source_origion = add_noise2batch(source_origion, sigma = IMG_noise_level, device=device)
+    target = add_noise2batch(target, sigma = IMG_noise_level, device=device)
+
+source = center_crop(source_origion, dim = dim, )
+'''
+
+def generate_registration_batches(source_origion, batch_size, device='cpu', Affine_noise_intensity=0, IMG_noise_level=0, dim=128, Tx_select=False):
+    if Tx_select:
+        Affine_batch = Generate_Affine_batch_selecTx(batch_size, Tx = Tx_select, Uniscale=False)
+    else:
+        Affine_batch = Generate_Affine_batch(batch_size)
+    #
+    data_device = source_origion.device.type
+    if data_device != device:
+        source_origion = source_origion.to(device)
+    if Affine_noise_intensity>0:
+        Affine_batch = add_noise2AffineMatrix(Affine_batch, sigma= Affine_noise_intensity)
+    if device !='cpu':
+        #source_origion = source_origion.to(device)
+        Affine_batch = Affine_batch.to(device)
+    warped_img_dim0 = warp_batch(Affine_batch, source_origion)
+    target = center_crop(warped_img_dim0, dim = dim)
+    if IMG_noise_level>0:
+        source_origion = add_noise2batch(source_origion, sigma = IMG_noise_level, device=device)
+        target = add_noise2batch(target, sigma = IMG_noise_level, device=device)
+    source = center_crop(source_origion, dim = dim)
+    X_batch = {'source':source,'target':target,'source_origion':source_origion}
+    Y_batch = {'Affine_mtrx': Affine_batch}
+    return X_batch, Y_batch
+
+
+
+dataiter = iter(valloader)
+source_origion = next(dataiter)
+
+X_batch, Y_batch = generate_registration_batches(source_origion, batch_size, device=device,
+                                        Affine_noise_intensity=0.1, IMG_noise_level=0.2, dim=128, Tx_select=False)
+
+
+Affine_batch = Affine_batch.to(device)
+source_origion = source_origion.to(device)
+
+import time 
+
+
+
+
+
+t_sum=0
+N_iter = 100
+for i in range(N_iter):
+    t0 = time.time()
+    Affine_batch = add_noise2AffineMatrix(Affine_batch.to('cpu'), sigma = Affine_noise_intensity)
+    t_sum += time.time() - t0
+
+(1280000/batch_size)*(t_sum/N_iter)/60
+
+
+
+
+
+
+
+t_sum=0
+N_iter = 100
+for i in range(N_iter):
+    t0 = time.time()
+    source_origion = add_noise2batch(source_origion, sigma = IMG_noise_level, device=device)
+    target = add_noise2batch(target, sigma = IMG_noise_level, device=device)
+    t_sum += time.time() - t0
+
+(1280000/batch_size)*(t_sum/N_iter)/60
+#Affine_mtrx = Generate_Affine_batch_selecTx(batch_size, Intitial_Tx, Uniscale=False)
+
+
+, device='cpu'
+
+
+
+t_sum=0
+N_iter = 100
+for i in range(N_iter):
+    t0 = time.time()
+    source_origion = add_noise2batch(source_origion, sigma = IMG_noise_level, device=device)
+    target = add_noise2batch(target, sigma = IMG_noise_level, device=device)
+    t_sum += time.time() - t0
+
+(1280000/batch_size)*(t_sum/N_iter)/60
+#Affine_mtrx = Generate_Affine_batch_selecTx(batch_size, Intitial_Tx, Uniscale=False)
+
+
+
+
+
+#plot
+'''
+Affine_mtrx[:,0,0]=0.8
+Affine_mtrx[:,1,1]=1.2
+Affine_mtrx[:,0,1]=0.3
+Affine_mtrx[:,1,0]=0.2
+Affine_mtrx[:,0,2]=0
+Affine_mtrx[:,1,2]=0
+i=0
+torchvision.transforms.ToPILImage()(source[i]).save(file_savingfolder+f'source_{i}.png'.format(i))
+torchvision.transforms.ToPILImage()(target[i]).save(file_savingfolder+f'target_{i}.png'.format(i))
+'''
+
+
+
+
+
+# Create empty affine matrices
+batch_size = 7
+
+
+
+
+
+
+
+
+
+'''
+batch_size = angles.shape[0]
+affine_matrices = torch.zeros(batch_size, 2, 3)
+# Compute the rotation matrices
+cos_angles = torch.cos(angles)
+sin_angles = torch.sin(angles)
+
+rotation_matrices = torch.stack([
+    torch.stack([cos_angles, -sin_angles], dim=1),
+    torch.stack([sin_angles, cos_angles], dim=1)], dim=1)
+
+# Compute the scaling matrices
+scaling_matrices = torch.zeros(batch_size, 2, 2)
+scaling_matrices[:, 0, 0] = scales[:, 0]
+scaling_matrices[:, 1, 1] = scales[:, 1]
+
+# Compute the shearing matrices
+shear_matrices = torch.ones(batch_size, 2, 2)
+shear_matrices[:, 0, 1] = shears[:, 0]
+shear_matrices[:, 1, 0] = shears[:, 1]
+
+# Compute the reflection matrices
+reflection_matrices = torch.zeros(batch_size, 2, 2)#torch.eye(2).repeat(batch_size, 1, 1)
+reflection_matrices[:, 0, 0] = reflections[:, 0]
+reflection_matrices[:, 1, 1] = reflections[:, 1]
+
+# Combine transformations: scale -> shear -> rotate -> reflect
+transform_matrices = torch.bmm(torch.bmm(torch.bmm(scaling_matrices, shear_matrices), rotation_matrices), reflection_matrices)
+#transform_matrices = torch.bmm(torch.bmm(shear_matrices, torch.bmm(reflection_matrices, scaling_matrices)), rotation_matrices)
+
+# Assign to affine matrices
+affine_matrices[:, :2, :2] = transform_matrices
+affine_matrices[:, :2, 2] = translations
+
+
+
+# Random scale factors between 0.2 and 2
+scales = torch.FloatTensor(batch_size,2).uniform_(0.2, 2.0)
+
+N_factors = 6
+N_samplesFromDistribution1 = np.random.randint(0, batch_size,N_factors)
+N_samplesFromDistribution2 = batch_size - N_samplesFromDistribution1
+
+k=0
+
+difficulty_min = 0.3
+difficulty_max = 0.7
+
+scale_pivot = 1
+scale1_min = scale_pivot - difficulty_max*(abs(scale_pivot-scale_range[0]))
+scale1_max = scale_pivot - difficulty_min*(abs(scale_pivot-scale_range[0]))
+scale2_min = scale_pivot + difficulty_min*(abs(scale_range[1]-scale_pivot))
+scale2_max = scale_pivot + difficulty_max*(abs(scale_range[1]-scale_pivot))
+
+print(f'[{scale1_min},{scale1_max}],[{scale2_min},{scale2_max}]')
+
+scales = torch.cat([ torch.FloatTensor(N_samplesFromDistribution1[k].item()).uniform_(scale1_min, scale1_max),
+                    torch.FloatTensor(N_samplesFromDistribution2[k].item()).uniform_(scale2_min, scale2_max) ])
+
+angle_range = [-180, 180]
+scale_range = [0.2,1.8]
+shear_range = [-0.5,0.5]
+translation_range = [-0.25,0.25]
+
+
+# Random scale factors between 0.2 and 2
+scales = torch.FloatTensor(batch_size,2).uniform_(0.2, 2.0)
+
+# Random rotation angles between -40 and 40 degrees (converted to radians)
+angles = torch.FloatTensor(batch_size).uniform_(-40, 40)*(math.pi / 180.0)
+
+# Random translation factors between -0.2 and 0.2
+translations = torch.FloatTensor(batch_size, 2).uniform_(-0.2, 0.2)
+
+# Random shearing factors between -0.5 and 0.5
+shears = torch.FloatTensor(batch_size, 2).uniform_(-0.5, 0.5)
+
+# Random reflection factors (-1 or 1)
+reflections = torch.randint(0, 2, (batch_size, 2)) * 2 - 1
+
+
+print("Affine Matrices:")
+print(affine_matrices)
+
+
+
+
+
+
+#Generate affine matrices
+# Affine_mtrx = torch.randn(batch_size, 2,3)
+
+import torch
+import math
+
+
+# Number of affine matrices
+batch_size = 7
+
+# Random scale factors between 0.2 and 2
+scales = torch.FloatTensor(batch_size, 2).uniform_(0.2, 2.0)
+
+# Random rotation angles between -40 and 40 degrees (converted to radians)
+angles = torch.FloatTensor(batch_size).uniform_(-40, 40) * (math.pi / 180.0)
+
+# Random translation factors between -0.2 and 0.2
+translations = torch.FloatTensor(batch_size, 2).uniform_(-0.2, 0.2)
+
+# Random shearing factors between -0.5 and 0.5
+shears = torch.FloatTensor(batch_size, 2).uniform_(-0.5, 0.5)
+
+# Initialize the affine matrices
+affine_matrices = torch.zeros(batch_size, 2, 3)
+
+
+for i in range(batch_size):
+    scale = scales[i]
+    angle = angles[i]
+    translation_x, translation_y = translations[i]
+    shear_x, shear_y = shears[i]
+    
+    # Rotation matrix
+    rotation_matrix = torch.tensor([
+        [math.cos(angle), -math.sin(angle)],
+        [math.sin(angle),  math.cos(angle)]
+    ])
+    
+    # Scaling matrix
+    scale_matrix = torch.tensor([
+        [scale, 0],
+        [0, scale]
+    ])
+    
+    # Shearing matrix
+    shear_matrix = torch.tensor([
+        [1, shear_x],
+        [shear_y, 1]
+    ])
+    
+    # Combine transformations: scale -> shear -> rotate
+    transform_matrix = scale_matrix @ shear_matrix @ rotation_matrix
+    
+    # Assign to affine matrix
+    affine_matrices[i, :2, :2] = transform_matrix
+    affine_matrices[i, :2, 2] = torch.tensor([translation_x, translation_y])
+
+
+print("Affine Matrices:")
+print(affine_matrices)
+
+'''
+X_item, Y_item = val_set.__getitem__(5)
+
+
+dataiter = iter(valloader)
+X_batch, Y_batch = next(dataiter)
+
+X_batch = move_dict2device(X_batch,device)
+Y_batch = move_dict2device(Y_batch,device)
+
+pred = IR_Model(X_batch)
+Affine_mtrx = pred['Affine_mtrx']
+
+
+
+
+
+
+
+
+
+
+
+
+
+self.mode = mode
+self.activedataset = DATASET[self.mode]
+self.registration_method = registration_method
+self.folder_suffix = folder_suffix
+self.Img_noise = Img_noise
+
+if self.activedataset == 'active':
+    Outputs = Load_augment(source_image_path, dim = self.dim)#,Img_noise=self.Img_noise)
+    source_origion = Outputs['source_origion'].to(torch.float32)
+    source = Outputs['source'].to(torch.float32)
+    target = Outputs['target'].to(torch.float32)
+    Affine_mtrx = Outputs['Affine_mtrx']#.to(torch.float32)
+    #Affine_parameters = Outputs['Affine_parameters']#.to(torch.float32)
+else:
+    source = load_image_pil_accelerated(source_image_path).to(torch.float32)
+    target = load_image_pil_accelerated(source_image_path.replace('source','target')).to(torch.float32)
+    with open(source_image_path.replace('source','matrix').replace('.JPEG','.npy'), 'rb') as f:
+        Affine_mtrx = torch.from_numpy(np.load(f))
+if self.Img_noise:
+    source_origion = add_noise2img(source_origion)
+    source = torchvision.transforms.CenterCrop((self.dim, self.dim))(source_origion).to(torch.float32)
+    target = add_noise2img(target)
+if 'Recurence' in self.registration_method:
+    M_i = Generate_Mi(folder_suffix=self.folder_suffix, mode=self.mode,
+            noise=Noise_level_dataset, Affine_mtrx= Affine_mtrx )
+    X = {'source':source,
+        'target':target,
+        'M_i' :M_i }
+    if 'Additive' in self.registration_method:
+        Y = {'Affine_mtrx': Affine_mtrx,
+           'Deviated_mtrx': Affine_mtrx - X['M_i']},
+    elif 'Multiplicative' in self.registration_method:
+        Y = {'Affine_mtrx': Affine_mtrx,
+           'Deviated_mtrx': torch.matmul(mtrx3(Affine_mtrx), torch.linalg.inv(mtrx3(X['M_i'])))[0:2,:]}
+else:
+    X = {'source':source,'target':target}
+    Y = {'Affine_mtrx': Affine_mtrx}
+X['source_origion'] = source_origion
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 class Identity(nn.Module):
     def __init__(self):
@@ -627,12 +1209,12 @@ def normalizedparameterline2Affine_matrx(line, device, Noise_level=0.0):
 def Normalize_AffineParameters(parameters):
    Norm_parameters = parameters.clone()
    Norm_parameters[:,0]/= 6.29
-   Norm_parameters[:,1] = (Norm_parameters[:,1] - 0.3)/1.4
-   Norm_parameters[:,2] = (Norm_parameters[:,2] - 0.3)/1.4
-   Norm_parameters[:,3] = (Norm_parameters[:,3] + 0.2)/0.4
-   Norm_parameters[:,4] = (Norm_parameters[:,4] + 0.2)/0.4
-   Norm_parameters[:,5] = (Norm_parameters[:,5] + 0.1)/0.2
-   Norm_parameters[:,6] = (Norm_parameters[:,6] + 0.1)/0.2
+   Norm_parameters[:,1] = (Norm_parameters[:,1] - 0.2)/1.6
+   Norm_parameters[:,2] = (Norm_parameters[:,2] - 0.2)/1.6
+   Norm_parameters[:,3] = (Norm_parameters[:,3] + 0.25)/0.5
+   Norm_parameters[:,4] = (Norm_parameters[:,4] + 0.25)/0.5
+   Norm_parameters[:,5] = (Norm_parameters[:,5] + 0.5)/1.0
+   Norm_parameters[:,6] = (Norm_parameters[:,6] + 0.5)/1.0
    Norm_parameters[:,7] = Norm_parameters[:,7]
    Norm_parameters[:,8] = Norm_parameters[:,8]
    return Norm_parameters
@@ -640,12 +1222,12 @@ def Normalize_AffineParameters(parameters):
 def DeNormalize_AffineParameters(Normalized_Parameters):
    DeNormalized_Parameters = Normalized_Parameters.clone()
    DeNormalized_Parameters[:,0]*= 6.29
-   DeNormalized_Parameters[:,1] = 1.4*DeNormalized_Parameters[:,1] + 0.3
-   DeNormalized_Parameters[:,2] = 1.4*DeNormalized_Parameters[:,2] + 0.3
-   DeNormalized_Parameters[:,3] = 0.4*DeNormalized_Parameters[:,3] - 0.2
-   DeNormalized_Parameters[:,4] = 0.4*DeNormalized_Parameters[:,4] - 0.2
-   DeNormalized_Parameters[:,5] = 0.2*DeNormalized_Parameters[:,5] - 0.1
-   DeNormalized_Parameters[:,6] = 0.2*DeNormalized_Parameters[:,6] - 0.1
+   DeNormalized_Parameters[:,1] = 1.6*DeNormalized_Parameters[:,1] + 0.2
+   DeNormalized_Parameters[:,2] = 1.6*DeNormalized_Parameters[:,2] + 0.2
+   DeNormalized_Parameters[:,3] = 0.5*DeNormalized_Parameters[:,3] - 0.25
+   DeNormalized_Parameters[:,4] = 0.5*DeNormalized_Parameters[:,4] - 0.25
+   DeNormalized_Parameters[:,5] = 1.0*DeNormalized_Parameters[:,5] - 0.5
+   DeNormalized_Parameters[:,6] = 1.0*DeNormalized_Parameters[:,6] - 0.5
    DeNormalized_Parameters[:,7] = DeNormalized_Parameters[:,7]
    DeNormalized_Parameters[:,8] = DeNormalized_Parameters[:,8]
    return DeNormalized_Parameters
@@ -685,14 +1267,14 @@ def batch_ToBWposition(img_batch):
     BWposition_batch[:,0,:,:] = torch.from_numpy(np.tile(Pos_y,[dim,1]))
     return BWposition_batch
 
-def add_noise2img(img0, sigma = 0.1):
+def add_noise2img(img0, sigma = IMG_noise_level):
     img0 = img0.detach()#.to(device_aug)
     s1 = sigma*torch.rand(1)#.to(device_aug)
     if torch.rand(1)>0.5:
         gamma = 0.2+0.8*torch.rand(1)+0.1
     else:
         gamma = 1+4*torch.rand(1)
-    c = torch.normal(torch.zeros_like(img0), s1*torch.ones_like(img0))#.to(device_aug)
+    c = torch.randn(img0.shape)*s1#torch.normal(torch.zeros_like(img0), s1*torch.ones_like(img0))#.to(device_aug)
     img0_clipped = torch.clip(img0*(1 + c),0,1)
     img_adjusted0 = (img0_clipped)**(gamma)#.to(device_aug))
     img_adjusted_clipped = torch.clip(img_adjusted0,0,1)
@@ -1271,12 +1853,116 @@ optimizer = torch.optim._multi_tensor.AdamW(IR_Model.parameters(), lr=Learning_r
 
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
 
+#def train_IR_model(IR_Model, trainloader, TOTAL_Epochs = 12,):
 training_loss_epochslist = []
 validation_loss_epochslist = []
 training_loss_iterationlist = []
+global_loss_iterationlist =[]
+M1_training_loss_iterationlist = []
 validation_loss_iterationlist = []
 TOTAL_Epochs = 12
 best_loss = 100000000000000000000
+
+
+for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
+    i=-1
+    running_loss = 0.0
+    loss_prnt_global= 0.0
+    loss_prnt_global1= 0.0
+    loss_prnt_cyclic0= 0.0
+    loss_prnt_cyclic1= 0.0
+    if Curriculum_learning:
+        #Difficulty_factor = min(1, (EPOCH+1)/TOTAL_Epochs)
+        #Difficulty_factor = min(1, np.log(0.5*EPOCH+1)/np.log(0.5*TOTAL_Epochs-7))
+        if EPOCH+7<TOTAL_Epochs:
+            Difficulty_factor= np.log(0.5*EPOCH+1)/np.log(0.5*TOTAL_Epochs)
+        else:
+            Difficulty_factor= 1
+        def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx, block_min =0, block_max= Difficulty_factor): 
+            wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
+            return wrapped_img, Affine_mtrx, Affine_parameters
+    if with_Difficultyadj_loss:
+        weight_loss = Difficulty_factor
+    else:
+        weight_loss = 0.5
+    if HPC:
+        loop = trainloader
+    else:
+        loop = tqdm.tqdm(trainloader)
+    for inputs, labels in loop:
+        i+=1
+        inputs = move_dict2device(inputs,device)
+        labels = move_dict2device(labels,device)
+        optimizer.zero_grad()
+        predections = IR_Model(inputs)
+        loss = 0.0
+        if with_global_loss:
+            global_loss = MSE_loss(labels['Affine_mtrx'], predections['Affine_mtrx'])
+            if include_loss_model1:
+                global_loss1 = MSE_loss(labels['Affine_mtrx'], predections['Affine_mtrx_0'])
+                loss_prnt_global1 += global_loss1.detach().item()
+                loss += (1-weight_loss)*global_loss + weight_loss*global_loss1
+            else:
+                #global_loss1 =0
+                loss_prnt_global1= 0
+                loss += global_loss
+            loss_prnt_global += loss.detach().item()
+        if with_Cyclic_losses:
+            Affine_mtrx_0_gt = torch.matmul( mtrx3(labels['Affine_mtrx']), mtrx3(inv_AM(predections['pred_1'])) )[:,:2,:3]
+            loss0_cyclic = cyclic_loss_factor*MSE_loss(Affine_mtrx_0_gt, predections['Affine_mtrx_0'])
+            loss_prnt_cyclic0 += loss0_cyclic.detach().item()
+            Affine_mtrx_1_gt = torch.matmul( mtrx3(inv_AM(predections['Affine_mtrx_0'])), mtrx3(labels['Affine_mtrx']))[:,:2,:3]
+            loss1_cyclic = cyclic_loss_factor*MSE_loss(Affine_mtrx_1_gt, predections['pred_1'])
+            loss_prnt_cyclic1 += loss1_cyclic.detach().item()
+            loss += (loss0_cyclic + loss1_cyclic)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.detach().item()
+        if i >0:
+            if i % print_every == 0:
+                eval_loss_x = test_loss(IR_Model, valloader,int(2000/batch_size),'Affine_mtrx').detach().item()
+                if with_scheduler:
+                    scheduler.step(eval_loss_x)
+                training_loss_iterationlist.append( threshold(running_loss/print_every))
+                validation_loss_iterationlist.append(threshold(eval_loss_x))
+                printed_text = f'[epoch:{EPOCH}, iter:{i:5d}], training loss: {running_loss/print_every:.3f}, eval loss:{eval_loss_x:.3f}, '                   
+                if with_global_loss:
+                    global_loss_iterationlist.append( threshold(loss_prnt_global/print_every))
+                    printed_text += f'global: {loss_prnt_global/print_every:.3f},'
+                    if include_loss_model1:
+                        M1_training_loss_iterationlist.append( threshold(loss_prnt_global1/print_every))
+                        printed_text += f'global1: {loss_prnt_global1/print_every:.3f},'
+                        FreePalestine = 1948
+                if with_Cyclic_losses:
+                    printed_text += f'cyclic0: {loss_prnt_cyclic0/print_every:.3f},'
+                    printed_text += f'cyclic1: {loss_prnt_cyclic1/print_every:.3f}'
+                print(printed_text)
+                if i >1:
+                    if eval_loss_x<best_loss:
+                        best_loss = eval_loss_x
+                running_loss = 0.0
+                loss_prnt_global= 0.0
+                loss_prnt_global1= 0.0
+                loss_prnt_cyclic0= 0.0
+                loss_prnt_cyclic1= 0.0
+    plt.plot(training_loss_iterationlist, label = 'training loss')
+    plt.plot(validation_loss_iterationlist, label = 'validation loss')
+    if with_global_loss:
+        plt.plot(global_loss_iterationlist, label = 'global loss')
+    if include_loss_model1:
+        plt.plot(M1_training_loss_iterationlist, label = 'model1 training loss')
+        np.savetxt(file_savingfolder+'M1_training_loss_iterationlist.txt', M1_training_loss_iterationlist, delimiter=",", fmt="%.3f")
+    
+    plt.legend()
+    plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
+    plt.close()
+    np.savetxt(file_savingfolder+'training_loss_iterationlist.txt', training_loss_iterationlist, delimiter=",", fmt="%.3f")
+    np.savetxt(file_savingfolder+'validation_loss_iterationlist.txt', validation_loss_iterationlist, delimiter=",", fmt="%.3f")
+    if with_global_loss:
+        np.savetxt(file_savingfolder+'global_loss_iterationlist.txt', global_loss_iterationlist, delimiter=",", fmt="%.3f")
+        
+        
+'''
 for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
     i=-1
     running_loss = 0.0
@@ -1289,7 +1975,7 @@ for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
         print('epoch:', EPOCH,', scheduled noise:' , scheduled_parameters())
     if Curriculum_learning:
         Difficulty_factor = min(1, (EPOCH+1)/TOTAL_Epochs
-        def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx, block_min =0, block_max= Difficulty_factor)): 
+        def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx, block_min =0, block_max= Difficulty_factor): 
             wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
         return wrapped_img, Affine_mtrx, Affine_parameters
     if HPC:
@@ -1342,6 +2028,7 @@ for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
         np.savetxt(file_savingfolder+'validation_loss_epochslist.txt', validation_loss_epochslist, delimiter=",", fmt="%.3f")
 
     print('Finished Training')
+'''
 
 torch.save(IR_Model.state_dict(), file_savingfolder+'IR_Model_EndTraining.pth')
 torch.save(core_model.state_dict(), file_savingfolder+'./core_model_EndTraining.pth')
@@ -1371,6 +2058,362 @@ plt.plot(validation_loss_iterationlist, label = 'validation loss')
 plt.legend()
 plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
 plt.close()
+
+
+
+
+
+
+
+
+
+
+
+
+## ----------------------------------------------------------------------------------
+
+## -------------------------------- Feature invariance model -------------------------------
+## -------------------------------- Feature invariance model -------------------------------
+## -------------------------------- Feature invariance model -------------------------------
+
+## ----------------------------------------------------------------------------------
+
+## ----------------------------------------------------------------------------------
+
+file_loadingfolder = '/home/ahmadh/MIR_savedmodel/Rawblock_Mi0:12Epochs_bidirectional__uniscale_AdjustPlot_avgPool_LR_V.concat__mobileVIT_active_0.1/'
+ext = '_EndTraining'#'_EndTraining' #_bestVal
+
+FREEZE_stage1 = False
+if 'VIT' in Arch:
+    if 'mobileVIT' in Arch:
+        from transformers import MobileViTV2ForImageClassification
+        core_model_stage1 = MobileViTV2ForImageClassification.from_pretrained("apple/mobilevitv2-1.0-imagenet1k-256")
+        if overlap=='vertical':
+            original_conv1 = core_model_stage1.mobilevitv2.conv_stem.convolution
+            new_conv1 = torch.nn.Conv2d(6,32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+            # Initialize the new convolutional layer's weights
+            with torch.no_grad():
+                new_conv1.weight[:, :3, :, :] = original_conv1.weight
+                new_conv1.weight[:, 3:, :, :] = original_conv1.weight
+            core_model_stage1.mobilevitv2.conv_stem.convolution = new_conv1
+            core_model_stage1.classifier = torch.nn.Linear(512, 6)
+    elif Arch == 'rawVIT':
+        core_model_stage1 = rawViT(img_size=128,in_channels=6,patch_size=12,embed_dim=384,hidden_dim=768,num_heads=12,num_layers=4, num_classes=6)
+    IR_Model_stage1 = Build_IRmodel_ViT(core_model_stage1,registration_method = registration_method, overlap=overlap, Arch = Arch)
+    core_model_stage1.to(device)
+    if FREEZE_stage1:
+        IR_Model_stage1.load_state_dict(torch.load(file_loadingfolder+'IR_Model'+ext+'.pth'))
+    IR_Model_stage1.to(device)
+
+
+# freeze weights of the first model
+if FREEZE_stage1:
+    IR_Model_stage1.eval()
+    for param in IR_Model_stage1.parameters():
+        param.requires_grad = False
+
+'''
+dataiter = iter(valloader)
+input_X_batch, Y_batch = next(dataiter)
+
+input_X_batch = move_dict2device(input_X_batch,device)
+Y_batch = move_dict2device(Y_batch,device)
+
+pred = IRmodel_finetuned(input_X_batch)
+Affine_mtrx = pred['Affine_mtrx']
+
+source = input_X_batch['source']
+target = input_X_batch['target']
+source_origion = input_X_batch['source_origion'].detach()
+
+predections_A = IR_Model_stage1(input_X_batch)
+pred_matrix_A = predections_A['Affine_mtrx']
+
+Global_reference = torch.nn.Parameter(torch.randn(128,3,dim,dim), requires_grad=True).to(device)#.unsqueeze(0).repeat([input_X_batch['source'].shape[0],1,1,1])
+input_X_batch_B = {'source':source, 'target':Global_reference}
+predections_B = IR_Model_stage1(input_X_batch_B)
+pred_matrix_B = predections_B['Affine_mtrx']
+
+input_X_batch_C = {'source':target, 'target':Global_reference}
+predections_C = IR_Model_stage1(input_X_batch_C)
+pred_matrix_C = predections_C['Affine_mtrx']
+'''
+
+'''
+New_Accumilative_Affine_matrix = torch.matmul(mtrx3(Accumilative_Affine_matrix), mtrx3(Affine_mtrx_j))[:,0:2,:]
+grd = torch.nn.functional.affine_grid(Affine_matrix0, size=source_origion.shape,align_corners=False)
+source_origion_224j = torch.nn.functional.grid_sample(source_origion, grid=grd,
+                        mode='bilinear', padding_mode='zeros', align_corners=False)
+wrapped_img = torchvision.transforms.CenterCrop((dim, dim))(source_origion_224j)
+'''
+
+
+
+class Build_IRmodel_wRef(torch.nn.Module):
+    def __init__(self,IR_Model_stage1):
+        super(Build_IRmodel_wRef, self).__init__()
+        self.IR_Model_stage1 = IR_Model_stage1
+        self.Global_reference = torch.nn.Parameter(torch.randn(3, dim, dim), requires_grad=True).to(device)
+        #self.overlap = overlap
+        #self.No_recurences = No_recurences
+    def forward(self, input_X_batch):
+        Global_reference_batches = self.Global_reference.unsqueeze(0).repeat([input_X_batch['source'].shape[0],1,1,1])
+        source = input_X_batch['source']
+        target = input_X_batch['target']
+        #source_origion = input_X_batch['source_origion'].detach()
+        predections_A = self.IR_Model_stage1(input_X_batch)
+        pred_matrix_A = predections_A['Affine_mtrx']
+        input_X_batch_B = {'source':source, 'target':Global_reference_batches}
+        predections_B = self.IR_Model_stage1(input_X_batch_B)
+        pred_matrix_B = predections_B['Affine_mtrx']
+        input_X_batch_C = {'source':target, 'target':Global_reference_batches}
+        predections_C = self.IR_Model_stage1(input_X_batch_C)
+        pred_matrix_C = predections_C['Affine_mtrx']
+        outcome = {'Affine_mtrx':pred_matrix_A, 'pred_matrix_A':pred_matrix_A, 'pred_matrix_B':pred_matrix_B,
+                     'pred_matrix_C':pred_matrix_C, 'Global_reference':self.Global_reference}
+        return outcome
+
+
+IRmodel_wRef = Build_IRmodel_wRef(IR_Model_stage1)
+
+IRmodel_wRef.Global_reference
+
+def count_trainable_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+print('Number of trainable paprameters: ',count_trainable_parameters(IRmodel_wRef)/1000000, 'Millions')
+print('Number of trainable paprameters: ',count_trainable_parameters(IR_Model_stage1)/1000000, 'Millions')
+
+pytorch_total_params = sum(p.numel() for p in IRmodel_wRef.parameters())
+print('Number of paprameters: ',pytorch_total_params/1000000, 'Millions')
+
+'''
+dataiter = iter(valloader)
+X_batch, Y_batch = next(dataiter)
+
+X_batch = move_dict2device(X_batch,device)
+Y_batch = move_dict2device(Y_batch,device)
+
+pred = IRmodel_wRef(X_batch)
+Affine_mtrx = pred['Affine_mtrx']
+'''
+
+
+if Arch == 'rawVIT':
+    Learning_rate = 0.0001
+else:
+    Learning_rate = 0.001
+
+print_every = int(2000*80/batch_size)
+MSE_loss = torch.nn.functional.mse_loss
+optimizer = optim.AdamW(IRmodel_wRef.parameters(), lr=Learning_rate)#, momentum=0.9
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+
+#def train_IR_model(IR_Model, trainloader, TOTAL_Epochs = 12,):
+training_loss_epochslist = []
+validation_loss_epochslist = []
+training_loss_iterationlist = []
+validation_loss_iterationlist = []
+TOTAL_Epochs = 12
+best_loss = 100000000000000000000
+for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
+    i=-1
+    running_loss = 0.0
+    loss_prnt_A= 0.0
+    loss_prnt_C= 0.0
+    loss_prnt_trivial_B =0.0
+    loss_prnt_trivial_C =0.0
+    #loss_prnt= 0.0
+    if Curriculum_learning:
+        Difficulty_factor = min(1, (EPOCH+1)/TOTAL_Epochs)
+        def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx, block_min =0, block_max= Difficulty_factor): 
+            wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
+            return wrapped_img, Affine_mtrx, Affine_parameters
+    if with_Difficultyadj_loss:
+        weight_loss = Difficulty_factor
+    else:
+        weight_loss = 0.2
+    if HPC:
+        loop = trainloader
+    else:
+        loop = tqdm.tqdm(trainloader)
+    for inputs, labels in loop:
+        i+=1
+        inputs = move_dict2device(inputs,device)
+        labels = move_dict2device(labels,device)
+        optimizer.zero_grad()
+        predections = IRmodel_wRef(inputs)
+        loss_A = MSE_loss(labels['Affine_mtrx'], predections['pred_matrix_A'])
+        Transient_matrix_C = torch.matmul(mtrx3(labels['Affine_mtrx']), mtrx3(predections['pred_matrix_B']))[:,0:2,:]
+        #Transient_matrix_A = torch.matmul(mtrx3(predections['pred_matrix_A']), mtrx3(predections['pred_matrix_B']))[:,0:2,:]
+        loss_C = MSE_loss(Transient_matrix_C, predections['pred_matrix_C'])
+        loss = (1-weight_loss)*loss_A + weight_loss*loss_C
+        #to avoid a trivial solution (when B = zero, loss_C becomes 0)
+        if Avoid_trivial:
+            #Trivial = -torch.max(torch.mean(torch.abs(predections['pred_matrix_C']-predections['pred_matrix_B'])), 0.1)
+            Trivial_B = -torch.max(torch.mean(torch.abs(predections['pred_matrix_B'])), 0.1)
+            Trivial_C = -torch.max(torch.mean(torch.abs(predections['pred_matrix_B'])), 0.1)
+            loss += weight_loss*(Trivial_B+Trivial_C)
+            loss_prnt_trivial_B += Trivial_B.detach().item()
+            loss_prnt_trivial_C += Trivial_C.detach().item()
+        loss_prnt_A += loss_A.detach().item()
+        loss_prnt_C += loss_C.detach().item()
+        #loss_prnt += loss.detach().item()
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.detach().item()
+        if i >0:
+            if i % print_every == 0:
+                eval_loss_x = test_loss(IRmodel_wRef, valloader,int(2000/batch_size),'Affine_mtrx').detach().item()
+                if with_scheduler:
+                    scheduler.step(eval_loss_x)
+                training_loss_iterationlist.append( threshold(running_loss/print_every))
+                validation_loss_iterationlist.append(threshold(eval_loss_x))
+                printed_text = f'[epoch:{EPOCH}, iter:{i:5d}], training loss: {running_loss/print_every:.3f}, eval loss:{eval_loss_x:.3f}, '
+                printed_text += f'loss_A: {loss_prnt_A/print_every:.3f}, loss_C:{loss_prnt_C/print_every:.3f}, '
+                if Avoid_trivial:
+                    printed_text += f'loss_TrivialB: {loss_prnt_trivial_B/print_every:.3f}, loss_TrivialC: {loss_prnt_trivial_C/print_every:.3f}, '
+                print(printed_text)
+                if i >1:
+                    if eval_loss_x<best_loss:
+                        best_loss = eval_loss_x
+                running_loss = 0.0
+                loss_prnt_A= 0.0
+                loss_prnt_C= 0.0
+                loss_prnt_trivial_B=0.0
+                loss_prnt_trivial_C=0.0
+    plt.plot(training_loss_iterationlist, label = 'training loss')
+    plt.plot(validation_loss_iterationlist, label = 'validation loss')
+    plt.legend()
+    plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
+    plt.close()
+    np.savetxt(file_savingfolder+'training_loss_iterationlist.txt', training_loss_iterationlist, delimiter=",", fmt="%.3f")
+    np.savetxt(file_savingfolder+'validation_loss_iterationlist.txt', validation_loss_iterationlist, delimiter=",", fmt="%.3f")
+    torchvision.transforms.ToPILImage()(IRmodel_wRef.Global_reference).save(file_savingfolder+f'Global_reference_{EPOCH}.png')
+
+IRmodel_wRef.Global_reference
+
+
+print('Finished Training')
+    #return IR_Model, training_loss_iterationlist, validation_loss_iterationlist
+
+#IR_Model_tst, training_loss_iterationlist, validation_loss_iterationlist = train_IR_model(IRmodel_finetuned, trainloader, TOTAL_Epochs = 12,)
+torchvision.transforms.ToPILImage()(IRmodel_wRef.Global_reference)).save(file_savingfolder+'Global_reference.png')
+
+torch.save(IRmodel_finetuned.state_dict(), file_savingfolder+'IRmodel_finetuned_EndTraining.pth')
+torch.save(IR_Model_stage2.state_dict(), file_savingfolder+'./IR_Model_stage2_EndTraining.pth')
+torch.save(IR_Model_stage1.state_dict(), file_savingfolder+'./IR_Model_stage1_EndTraining.pth')
+torch.save(core_model_stage2.state_dict(), file_savingfolder+'./core_model_stage2_EndTraining.pth')
+torch.save(core_model_stage1.state_dict(), file_savingfolder+'./core_model_stage1_EndTraining.pth')
+
+
+
+
+
+with open(file_savingfolder+'training_loss_iterationlist.npy', 'wb') as f:
+    np.save(f, np.array(training_loss_iterationlist))
+
+with open(file_savingfolder+'validation_loss_iterationlist.npy', 'wb') as f:
+    np.save(f, np.array(validation_loss_iterationlist))
+
+
+plt.plot(training_loss_iterationlist, label = 'training loss')
+plt.plot(validation_loss_iterationlist, label = 'validation loss')
+plt.legend()
+plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
+plt.close()
+
+
+
+os.system('mkdir '+ file_savingfolder+ 'MIRexamples')
+AM_recurrent_loss(IR_Model_stage2.eval(),testloader0 , max_iterations=100, No_recurences = 7, key ='Affine_mtrx', plot=True, plot_batach = 5, prefix = 'randomdifficulty')
+
+
+def test_loss_i(model, loader, max_iterations=100, key = 'Affine_mtrx'):
+    eval_loss_tot = {}
+    eval_loss_avg = {}
+    with torch.no_grad():
+        for i, data in enumerate(loader, 0):
+            if i < max_iterations:
+                inputs, labels = data
+                inputs = move_dict2device(inputs,device)
+                labels = move_dict2device(labels,device)
+                predections = model(inputs)
+                try:
+                    for k in predections.keys():
+                        eval_loss_tot[k] += MSE_loss(labels[key], predections[k].detach())
+                        eval_loss_avg[k] = eval_loss_tot[k].detach().item()/i
+                except:
+                    for k in predections.keys():
+                        eval_loss_tot[k]=0
+                        eval_loss_avg[k]=0
+                    print('initialization')
+            else :
+                return eval_loss_avg
+    return eval_loss_avg
+
+
+
+
+IRmodel_finetuned3 = Build_IRmodel_finetuned_ViT(IR_Model_stage1.eval(), IR_Model_stage2.eval(),No_recurences=4)
+MSE_AffineMatrix_recurrent_difficulty = {}
+for Difficulty in BLOCK_options.keys():
+    Block_min_difficulty, Block_max_difficulty= BLOCK_options[Difficulty]
+    MEASURES= Intitial_Tx
+    Noise_level_testset=0
+    def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_MESURE=MEASURES, block_min =Block_min_difficulty, block_max=Block_max_difficulty): 
+        wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
+        return wrapped_img, Affine_mtrx, Affine_parameters
+    MSE_AffineMatrix_recurrent_difficulty[Difficulty] = test_loss_i(IRmodel_finetuned3.eval(), testloader0,70, key = 'Affine_mtrx')#.detach().item()
+
+
+print(MSE_AffineMatrix_recurrent_difficulty)
+json.dump(MSE_AffineMatrix_recurrent_difficulty, open( file_savingfolder+'MSE_AffineMatrix_recurrent_difficulty_model1-3xmodel2.txt', 'w' ) )
+
+
+
+def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_MESURE=MEASURES, block_min =0, block_max=1): 
+    wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
+    return wrapped_img, Affine_mtrx, Affine_parameters
+
+
+save_examples(IRmodel_finetuned3,testloader0, n_examples = 6, plt_elipses=True,plt_imgs=True,time=6, feed_origion=True, shadow=True, win=9)
+
+
+
+IRmodel_finetuned
+AM_recurrent_loss(IRmodel_finetuned.eval(),testloader0 , max_iterations=10, No_recurences = 2, key ='Affine_mtrx', plot=False, plot_batach = 0, prefix = 'randomdifficulty')
+
+
+Measures_list = Intitial_Tx#['angle', 'scaleX','scaleY','translationX','translationY','shearX','shearY', 'reflectionX', 'reflectionY']
+BLOCK_options = {'Full':(0,1), 'Hard70-100%':(0.7,1), 'Medium30-70':(0.3,0.7), 'Easy10-30%':(0.1,0.3), 'Easier5-10%':(0.05,0.1), 'Easiest0-5%':(0,0.05)}
+MSE_AffineMatrix_recurrent_difficulty = {}
+for Difficulty in BLOCK_options.keys():
+    Block_min_difficulty, Block_max_difficulty= BLOCK_options[Difficulty]
+    MEASURES= Intitial_Tx
+    Noise_level_testset=0
+    def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_MESURE=MEASURES, block_min =Block_min_difficulty, block_max=Block_max_difficulty): 
+        wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
+        return wrapped_img, Affine_mtrx, Affine_parameters
+    MSE_AffineMatrix_recurrent_difficulty[Difficulty] = AM_recurrent_loss(IRmodel_finetuned.eval(),testloader0, max_iterations=70,
+                                                                            No_recurences = 5, key ='Affine_mtrx', plot=True, plot_batach = 5, prefix = Difficulty)
+
+
+
+print(MSE_AffineMatrix_recurrent_difficulty)
+json.dump(MSE_AffineMatrix_recurrent_difficulty, open( file_savingfolder+'MSE_AffineMatrix_recurrent_difficulty_full_model.txt', 'w' ) )
+
+
+
+
+
+
+## ----------------------------------------------------------------------------------
+
+
+
+
+
 
 
 
@@ -1567,8 +2610,7 @@ print(prof.key_averages().table(sort_by="cpu_memory_usage", row_limit=10))
 
 '''
 
-with_Difficultyadj_loss = False
-include_loss_model1 = True
+
 Learning_rate = 0.0001
 cyclic_loss_factor = 0.05
 
@@ -1582,11 +2624,16 @@ training_loss_epochslist = []
 validation_loss_epochslist = []
 training_loss_iterationlist = []
 M1_training_loss_iterationlist = []
+global_loss_iterationlist = []
 validation_loss_iterationlist = []
 TOTAL_Epochs = 12
+if Curriculum_learning:
+    TOTAL_Epochs = 45
+
 best_loss = 100000000000000000000
 
-for EPOCH in range(18, 18+TOTAL_Epochs):  # loop over the dataset multiple times
+
+for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
     i=-1
     running_loss = 0.0
     loss_prnt_global= 0.0
@@ -1594,7 +2641,113 @@ for EPOCH in range(18, 18+TOTAL_Epochs):  # loop over the dataset multiple times
     loss_prnt_cyclic0= 0.0
     loss_prnt_cyclic1= 0.0
     if Curriculum_learning:
-        Difficulty_factor = min(1, (EPOCH+1)/TOTAL_Epochs)
+        #Difficulty_factor = min(1, (EPOCH+1)/TOTAL_Epochs)
+        #Difficulty_factor = min(1, np.log(0.5*EPOCH+1)/np.log(0.5*TOTAL_Epochs-7))
+        if EPOCH+7<TOTAL_Epochs:
+            Difficulty_factor= np.log(0.5*EPOCH+1)/np.log(0.5*TOTAL_Epochs)
+        else:
+            Difficulty_factor= 1
+        def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx, block_min =0, block_max= Difficulty_factor): 
+            wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
+            return wrapped_img, Affine_mtrx, Affine_parameters
+    if with_Difficultyadj_loss:
+        weight_loss = Difficulty_factor
+    else:
+        weight_loss = 0.5
+    if HPC:
+        loop = trainloader
+    else:
+        loop = tqdm.tqdm(trainloader)
+    for inputs, labels in loop:
+        i+=1
+        inputs = move_dict2device(inputs,device)
+        labels = move_dict2device(labels,device)
+        optimizer.zero_grad()
+        predections = IRmodel_finetuned(inputs)
+        loss = 0.0
+        if with_global_loss:
+            global_loss = MSE_loss(labels['Affine_mtrx'], predections['Affine_mtrx'])
+            if include_loss_model1:
+                global_loss1 = MSE_loss(labels['Affine_mtrx'], predections['Affine_mtrx_0'])
+                loss_prnt_global1 += global_loss1.detach().item()
+                loss += (1-weight_loss)*global_loss + weight_loss*global_loss1
+            else:
+                #global_loss1 =0
+                loss_prnt_global1= 0
+                loss += global_loss
+            loss_prnt_global += loss.detach().item()
+        if with_Cyclic_losses:
+            Affine_mtrx_0_gt = torch.matmul( mtrx3(labels['Affine_mtrx']), mtrx3(inv_AM(predections['pred_1'])) )[:,:2,:3]
+            loss0_cyclic = cyclic_loss_factor*MSE_loss(Affine_mtrx_0_gt, predections['Affine_mtrx_0'])
+            loss_prnt_cyclic0 += loss0_cyclic.detach().item()
+            Affine_mtrx_1_gt = torch.matmul( mtrx3(inv_AM(predections['Affine_mtrx_0'])), mtrx3(labels['Affine_mtrx']))[:,:2,:3]
+            loss1_cyclic = cyclic_loss_factor*MSE_loss(Affine_mtrx_1_gt, predections['pred_1'])
+            loss_prnt_cyclic1 += loss1_cyclic.detach().item()
+            loss += (loss0_cyclic + loss1_cyclic)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.detach().item()
+        if i >0:
+            if i % print_every == 0:
+                eval_loss_x = test_loss(IRmodel_finetuned, valloader,int(2000/batch_size),'Affine_mtrx').detach().item()
+                if with_scheduler:
+                    scheduler.step(eval_loss_x)
+                training_loss_iterationlist.append( threshold(running_loss/print_every))
+                validation_loss_iterationlist.append(threshold(eval_loss_x))
+                printed_text = f'[epoch:{EPOCH}, iter:{i:5d}], training loss: {running_loss/print_every:.3f}, eval loss:{eval_loss_x:.3f}, '                   
+                if with_global_loss:
+                    global_loss_iterationlist.append( threshold(loss_prnt_global/print_every))
+                    printed_text += f'global: {loss_prnt_global/print_every:.3f},'
+                    if include_loss_model1:
+                        M1_training_loss_iterationlist.append( threshold(loss_prnt_global1/print_every))
+                        printed_text += f'global1: {loss_prnt_global1/print_every:.3f},'
+                        FreePalestine = 1948
+                if with_Cyclic_losses:
+                    printed_text += f'cyclic0: {loss_prnt_cyclic0/print_every:.3f},'
+                    printed_text += f'cyclic1: {loss_prnt_cyclic1/print_every:.3f}'
+                print(printed_text)
+                if i >1:
+                    if eval_loss_x<best_loss:
+                        best_loss = eval_loss_x
+                running_loss = 0.0
+                loss_prnt_global= 0.0
+                loss_prnt_global1= 0.0
+                loss_prnt_cyclic0= 0.0
+                loss_prnt_cyclic1= 0.0
+    plt.plot(training_loss_iterationlist, label = 'training loss')
+    plt.plot(validation_loss_iterationlist, label = 'validation loss')
+    if with_global_loss:
+        plt.plot(global_loss_iterationlist, label = 'training loss')
+        np.savetxt(file_savingfolder+'global_loss_iterationlist.txt', global_loss_iterationlist, delimiter=",", fmt="%.3f")
+    if include_loss_model1:
+        plt.plot(M1_training_loss_iterationlist, label = 'model1 training loss')
+        np.savetxt(file_savingfolder+'M1_training_loss_iterationlist.txt', M1_training_loss_iterationlist, delimiter=",", fmt="%.3f")
+    plt.legend()
+    plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
+    plt.close()
+    np.savetxt(file_savingfolder+'training_loss_iterationlist.txt', training_loss_iterationlist, delimiter=",", fmt="%.3f")
+    np.savetxt(file_savingfolder+'validation_loss_iterationlist.txt', validation_loss_iterationlist, delimiter=",", fmt="%.3f")
+    
+
+
+
+'''
+
+
+for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
+    i=-1
+    running_loss = 0.0
+    loss_prnt_global= 0.0
+    loss_prnt_global1= 0.0
+    loss_prnt_cyclic0= 0.0
+    loss_prnt_cyclic1= 0.0
+    if Curriculum_learning:
+        Difficulty_factor = min(1, np.log(0.5*(EPOCH+1))/np.log(0.5*TOTAL_Epochs-7))
+        #Difficulty_factor = min(1, (EPOCH+1)/TOTAL_Epochs)
+        #if EPOCH+7<TOTAL_Epochs:
+        #    Difficulty_factor= np.log(0.5*(EPOCH+1))/np.log(0.5*TOTAL_Epochs)
+        #else:
+        #    Difficulty_factor= 1
         def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx, block_min =0, block_max= Difficulty_factor): 
             wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
             return wrapped_img, Affine_mtrx, Affine_parameters
@@ -1664,17 +2817,16 @@ for EPOCH in range(18, 18+TOTAL_Epochs):  # loop over the dataset multiple times
                 loss_prnt_cyclic0= 0.0
                 loss_prnt_cyclic1= 0.0
     plt.plot(training_loss_iterationlist, label = 'training loss')
-    if with_global_loss:
-        plt.plot(M1_training_loss_iterationlist, label = 'model1 training loss')
     plt.plot(validation_loss_iterationlist, label = 'validation loss')
+    if include_loss_model1:
+        plt.plot(M1_training_loss_iterationlist, label = 'model1 training loss')
+        np.savetxt(file_savingfolder+'M1_training_loss_iterationlist.txt', M1_training_loss_iterationlist, delimiter=",", fmt="%.3f")
     plt.legend()
     plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
     plt.close()
     np.savetxt(file_savingfolder+'training_loss_iterationlist.txt', training_loss_iterationlist, delimiter=",", fmt="%.3f")
     np.savetxt(file_savingfolder+'validation_loss_iterationlist.txt', validation_loss_iterationlist, delimiter=",", fmt="%.3f")
-    if with_global_loss:
-        np.savetxt(file_savingfolder+'M1_training_loss_iterationlist.txt', M1_training_loss_iterationlist, delimiter=",", fmt="%.3f")
-        
+'''
 
 print('Finished Training')
     #return IR_Model, training_loss_iterationlist, validation_loss_iterationlist

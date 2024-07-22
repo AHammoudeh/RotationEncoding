@@ -1,4 +1,67 @@
 '''
+G = torch.randn(3, requires_grad=True, device = device)
+
+class testM(torch.nn.Module):
+    def __init__(self,Global_reference, dim=3):
+        super(testM, self).__init__()
+        self.Global_reference = Global_reference
+        #self.Global_reference = torch.randn(dim, requires_grad=True).to(device)#torch.nn.Parameter(
+        self.fc2 =nn.Linear(2*dim, 20)
+        self.fc3 =nn.Linear(20, 1)
+    def forward(self, input_X_batch):
+        Global_reference_batches = self.Global_reference.unsqueeze(0).repeat([input_X_batch.shape[0],1])
+        x1 = torch.concatenate((Global_reference_batches, input_X_batch), dim=-1)
+        x2 = self.fc2(x1)
+        x3 = self.fc3(x2)
+        return x3
+
+
+
+class testM(torch.nn.Module):
+    def __init__(self,dim=3):
+        super(testM, self).__init__()
+        #self.Global_reference = Global_reference
+        self.Global_reference = torch.nn.Parameter(torch.rand(dim))#, requires_grad=True, device = device
+        self.fc2 =nn.Linear(2*dim, 20)
+        self.fc3 =nn.Linear(20, 1)
+    def forward(self, input_X_batch):
+        Global_reference_batches = self.Global_reference.unsqueeze(0)#
+        Global_reference_batches = Global_reference_batches.repeat([input_X_batch.shape[0],1])
+        x1 = torch.concatenate((Global_reference_batches, input_X_batch), dim=-1)
+        x2 = self.fc2(x1)
+        x3 = self.fc3(x2)
+        return x3
+
+model = testM(G).to(device)
+
+model = testM().to(device)
+p = model(torch.randn(100,3).to(device))
+p.shape
+
+ref0 = model.Global_reference
+print(ref0)
+batch_size =10
+X = torch.randn(1000,3).to(device)
+Y = torch.sum(X**2 + 0.3, dim=1).to(device)
+
+#params = list(model.parameters()#)+[G]
+optimizer = optim.AdamW(model.parameters(), lr=0.001)#, momentum=0.9
+
+for i in tqdm.tqdm(range(int(X.shape[0]/batch_size))):
+    x_input = X[i*batch_size:(i+1)*batch_size, ]
+    label = Y[i*batch_size:(i+1)*batch_size]
+    optimizer.zero_grad()
+    pred = model(x_input)
+    loss = torch.mean((label - pred)**2)
+    loss.backward()
+    optimizer.step()
+    ref = model.Global_reference.detach().to('cpu')
+    print('Loss:', loss.item() , 'ref:' ,ref )
+'''
+
+
+
+'''
 conda create --name Tx
 conda actiavet Tx
 conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
@@ -15,6 +78,7 @@ apple/mobilevitv2-1.0-voc-deeplabv3
 
 #----------------------------------------------------------------
 import os, sys
+import math
 import numpy as np
 from PIL import Image
 import itertools
@@ -40,30 +104,30 @@ import transformers
 
 HPC = False
 SM1 = True #SM1 server
-device_num = 1
+device_num = 0
 torch.cuda.set_device(device_num)
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 device_aug = 'cpu'#device#'cpu'
 
-Fine_tuned = False
-with_Global_reference= True
-Curriculum_learning = False
-Avoid_trivial = True
+Fine_tuned = True
+with_Global_reference= False
+Curriculum_learning = True
+Avoid_trivial = False
 with_global_loss = True
 with_Cyclic_losses = False
 Active_learning = False
 with_Difficultyadj_loss = False
-include_loss_model1 = False
+include_loss_model1 = True
 Arch = 'mobileVIT'#{#'mobileVIT'#'rawVIT'#'ResNet''VTX', 'U-Net','ResNet', 'DINO' ,'rawVIT' }#'mobileVITwithMI'
 overlap='vertical' #'vertical' #'horizontal'
 registration_method = 'Rawblock'#'Additive_Recurence' #{'Additive_Recurence','Rawblock', 'matching_points', 'Additive_Recurence', 'Multiplicative_Recurence'} #'recurrent_matrix',
 Uniscale = False
 with_scheduler = True
-IMG_noise = True
+IMG_noise = False
 SWITCH = False
 
 global Noise_level_dataset
-Noise_level_dataset=0.1
+Noise_level_dataset=0.5
 LYR_NORM = False
 Fix_Torch_Wrap = False
 BW_Position = False
@@ -75,7 +139,7 @@ dim0 =224
 crop_ratio = dim/dim0
 
 if Fine_tuned:
-    folder_suffix = 'Tr_FT2_'
+    folder_suffix = 'DifficultFirst30epochLR0.001_FT2_'
     if with_Cyclic_losses:
         folder_suffix += 'cyclic_'
     if with_global_loss:
@@ -123,7 +187,7 @@ if BW_Position:
     folder_suffix += '.BWPosition'
 
 if IMG_noise:
-    IMG_noise_level = 0.2
+    IMG_noise_level = 0.1
     batch_size = 128
     folder_suffix += 'ImgNoise{}_'.format(IMG_noise_level)
 else:
@@ -349,7 +413,7 @@ def transform_standard_points(Affine_mat, x,y):
     yt0 = XYt[1]
     return xt0, yt0
 
-def save_examples(model, loader , n_examples = 4, plt_elipses=True,plt_imgs=False, time=1, feed_origion=True, shadow=False, win = 5):
+def save_examples(model, loader , n_examples = 4, plt_markrs=True,plt_imgs=False, time=1, feed_origion=True, shadow=False, win = 5):
     #prepare figures
     if shadow:
         Pixel_NCC = Torch_NCC(win=win,stride = 1).ncc
@@ -400,7 +464,7 @@ def save_examples(model, loader , n_examples = 4, plt_elipses=True,plt_imgs=Fals
                 colored_shadow[:,1:2,:,:] = Green
                 #colored_shadow[:,2:3,:,:] = Blue#'''
                 Error_map = torch.abs(target.detach()-wrapped_img.detach())
-            if plt_elipses:
+            if plt_markrs:
                 x0_source, y0_source = generate_standard_mark()#N_samples = 50, a= 2,b = 1, start=-0.5)
                 #x0_source, y0_source = generate_standard_elips(N_samples = 100)
                 x0_target, y0_target = transform_standard_points(M_GroundTruth[k], x0_source, y0_source)
@@ -434,7 +498,7 @@ def save_examples(model, loader , n_examples = 4, plt_elipses=True,plt_imgs=Fals
             ax.axes.get_xaxis().set_visible(False)
             ax.axes.get_yaxis().set_visible(False)
         suffix = ''
-        if plt_elipses:
+        if plt_markrs:
                 suffix += 'Elipse'
         if plt_imgs:
                 suffix += 'Img'
@@ -444,9 +508,9 @@ def save_examples(model, loader , n_examples = 4, plt_elipses=True,plt_imgs=Fals
 
 def save_n_examples(model, loader,n_times=2, n_examples_per_time = 4 ):
     for m in range(n_times):
-        save_examples(model, loader, n_examples = n_examples_per_time, plt_elipses=True, plt_imgs=False, time =m)
-        save_examples(model, loader, n_examples = n_examples_per_time, plt_elipses=False, plt_imgs=True, time =m)
-        save_examples(model, loader, n_examples = n_examples_per_time, plt_elipses=True, plt_imgs=True, time =m)
+        save_examples(model, loader, n_examples = n_examples_per_time, plt_markrs=True, plt_imgs=False, time =m)
+        save_examples(model, loader, n_examples = n_examples_per_time, plt_markrs=False, plt_imgs=True, time =m)
+        save_examples(model, loader, n_examples = n_examples_per_time, plt_markrs=True, plt_imgs=True, time =m)
 
 def pil_to_numpy(im):
     im.load()
@@ -693,6 +757,7 @@ def batch_ToBWposition(img_batch):
     BWposition_batch[:,0,:,:] = torch.from_numpy(np.tile(Pos_y,[dim,1]))
     return BWposition_batch
 
+'''
 def add_noise2img(img0, sigma = IMG_noise_level):
     img0 = img0.detach()#.to(device_aug)
     s1 = sigma*torch.rand(1)#.to(device_aug)
@@ -705,6 +770,21 @@ def add_noise2img(img0, sigma = IMG_noise_level):
     img_adjusted0 = (img0_clipped)**(gamma)#.to(device_aug))
     img_adjusted_clipped = torch.clip(img_adjusted0,0,1)
     return img_adjusted_clipped.detach()
+'''
+
+def add_noise2img(img0, sigma = IMG_noise_level):
+    img0 = img0.detach()#.to(device_aug)
+    s1 = sigma*torch.rand(1)#.to(device_aug)
+    if torch.rand(1)>0.5:
+        gamma = 0.2+0.8*torch.rand(1)+0.1
+    else:
+        gamma = 1+4*torch.rand(1)
+    c = torch.randn(img0.shape)*s1#torch.normal(torch.zeros_like(img0), s1*torch.ones_like(img0))#.to(device_aug)
+    img0_clipped = torch.clip(img0*(1 + c),0,1)
+    img_adjusted0 = (img0_clipped)**(gamma)#.to(device_aug))
+    img_adjusted_clipped = torch.clip(img_adjusted0,0,1)
+    return img_adjusted_clipped.detach()
+
 
 def Generate_Mi(folder_suffix='completely_random', mode='test', noise=0, block_min =0, block_max=1, Affine_mtrx=torch.zeros([2,3]) ):
     if 'completely_random' in folder_suffix :
@@ -1156,11 +1236,6 @@ class Build_Ensemble_IRmodel(nn.Module):
 
 
 
-
-
-
-
-
 #------------------------Data--------------------------------
 #---------------------------------------------------
 #---------------------------------------------------
@@ -1441,7 +1516,7 @@ for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
     plt.close()
     np.savetxt(file_savingfolder+'training_loss_iterationlist.txt', training_loss_iterationlist, delimiter=",", fmt="%.3f")
     np.savetxt(file_savingfolder+'validation_loss_iterationlist.txt', validation_loss_iterationlist, delimiter=",", fmt="%.3f")
-    #save_examples(IR_Model,valloader, n_examples = 6, plt_elipses=True,plt_imgs=True)
+    #save_examples(IR_Model,valloader, n_examples = 6, plt_markrs=True,plt_imgs=True)
     if with_epch_loss:
         training_loss_epochslist.append(threshold(test_loss(IR_Model, trainloader,int(10000/batch_size),'Affine_mtrx').detach().item()))
         validation_loss_epochslist.append(threshold(test_loss(IR_Model, valloader,int(10000/batch_size),'Affine_mtrx').detach().item()))
@@ -1677,8 +1752,8 @@ for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
         #to avoid a trivial solution (when B = zero, loss_C becomes 0)
         if Avoid_trivial:
             #Trivial = -torch.max(torch.mean(torch.abs(predections['pred_matrix_C']-predections['pred_matrix_B'])), 0.1)
-            Trivial_B = -torch.max(torch.mean(torch.abs(predections['pred_matrix_B'])), 0.1)
-            Trivial_C = -torch.max(torch.mean(torch.abs(predections['pred_matrix_B'])), 0.1)
+            Trivial_B = -torch.min( torch.max(torch.mean(torch.abs(predections['pred_matrix_B'])), 0.02), 0.2)
+            Trivial_C = -torch.min( torch.max(torch.mean(torch.abs(predections['pred_matrix_B'])), 0.02), 0.2)
             loss += weight_loss*(Trivial_B+Trivial_C)
             loss_prnt_trivial_B += Trivial_B.detach().item()
             loss_prnt_trivial_C += Trivial_C.detach().item()
@@ -1710,6 +1785,7 @@ for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
                 loss_prnt_trivial_C=0.0
     plt.plot(training_loss_iterationlist, label = 'training loss')
     plt.plot(validation_loss_iterationlist, label = 'validation loss')
+    plt.ylim(0,0.5)
     plt.legend()
     plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
     plt.close()
@@ -1726,14 +1802,9 @@ print('Finished Training')
 #IR_Model_tst, training_loss_iterationlist, validation_loss_iterationlist = train_IR_model(IRmodel_finetuned, trainloader, TOTAL_Epochs = 12,)
 torchvision.transforms.ToPILImage()(IRmodel_wRef.Global_reference)).save(file_savingfolder+'Global_reference.png')
 
-torch.save(IRmodel_finetuned.state_dict(), file_savingfolder+'IRmodel_finetuned_EndTraining.pth')
-torch.save(IR_Model_stage2.state_dict(), file_savingfolder+'./IR_Model_stage2_EndTraining.pth')
+torch.save(IRmodel_wRef.state_dict(), file_savingfolder+'IRmodel_wRef_EndTraining.pth')
 torch.save(IR_Model_stage1.state_dict(), file_savingfolder+'./IR_Model_stage1_EndTraining.pth')
-torch.save(core_model_stage2.state_dict(), file_savingfolder+'./core_model_stage2_EndTraining.pth')
 torch.save(core_model_stage1.state_dict(), file_savingfolder+'./core_model_stage1_EndTraining.pth')
-
-
-
 
 
 with open(file_savingfolder+'training_loss_iterationlist.npy', 'wb') as f:
@@ -1745,6 +1816,7 @@ with open(file_savingfolder+'validation_loss_iterationlist.npy', 'wb') as f:
 
 plt.plot(training_loss_iterationlist, label = 'training loss')
 plt.plot(validation_loss_iterationlist, label = 'validation loss')
+plt.ylim(0,0.5)
 plt.legend()
 plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
 plt.close()
@@ -1752,7 +1824,14 @@ plt.close()
 
 
 os.system('mkdir '+ file_savingfolder+ 'MIRexamples')
-AM_recurrent_loss(IR_Model_stage2.eval(),testloader0 , max_iterations=100, No_recurences = 7, key ='Affine_mtrx', plot=True, plot_batach = 5, prefix = 'randomdifficulty')
+save_examples(IR_Model_stage1.eval(),testloader0, n_examples = 6, plt_markrs=True,plt_imgs=True,time=6, feed_origion=True, shadow=True, win=9)
+save_examples(IR_Model_stage1.eval(),testloader, n_examples = 6, plt_markrs=True,plt_imgs=True,time=5, feed_origion=True, shadow=True, win=9)
+MSE_affine = test_loss(IR_Model_stage1.eval(), testloader0,10, key = 'Affine_mtrx').detach().item()
+
+MSE_affine = test_loss(IR_Model_stage1.eval(), testloader,30, key = 'Affine_mtrx').detach().item()
+
+
+AM_recurrent_loss(IR_Model_stage1.eval(),testloader0 , max_iterations=100, No_recurences = 7, key ='Affine_mtrx', plot=True, plot_batach = 5, prefix = 'randomdifficulty')
 
 
 def test_loss_i(model, loader, max_iterations=100, key = 'Affine_mtrx'):
@@ -1767,21 +1846,25 @@ def test_loss_i(model, loader, max_iterations=100, key = 'Affine_mtrx'):
                 predections = model(inputs)
                 try:
                     for k in predections.keys():
-                        eval_loss_tot[k] += MSE_loss(labels[key], predections[k].detach())
-                        eval_loss_avg[k] = eval_loss_tot[k].detach().item()/i
+                        if 'Affine_mtrx_' in k:
+                            eval_loss_tot[k] += MSE_loss(labels[key], predections[k].detach())
+                            eval_loss_avg[k] = np.round(eval_loss_tot[k].detach().item()/i, 4)
                 except:
                     for k in predections.keys():
-                        eval_loss_tot[k]=0
-                        eval_loss_avg[k]=0
-                    print('initialization')
+                        if 'Affine_mtrx_' in k:
+                            eval_loss_tot[k]=0
+                            eval_loss_avg[k]=0
+                    #print('initialization')
             else :
                 return eval_loss_avg
     return eval_loss_avg
 
 
 
+IRmodel_finetuned3 = Build_IRmodel_finetuned_ViT(IR_Model_stage1.eval(), IR_Model_stage2.eval(),No_recurences=12)
 
-IRmodel_finetuned3 = Build_IRmodel_finetuned_ViT(IR_Model_stage1.eval(), IR_Model_stage2.eval(),No_recurences=4)
+BLOCK_options = {'Full':(0,1), 'Hard70-100%':(0.7,1), 'Medium30-70':(0.3,0.7), 'Easy10-30%':(0.1,0.3), 'Easier5-10%':(0.05,0.1), 'Easiest0-5%':(0,0.05)}
+
 MSE_AffineMatrix_recurrent_difficulty = {}
 for Difficulty in BLOCK_options.keys():
     Block_min_difficulty, Block_max_difficulty= BLOCK_options[Difficulty]
@@ -1802,14 +1885,10 @@ def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_ME
     wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
     return wrapped_img, Affine_mtrx, Affine_parameters
 
-
-save_examples(IRmodel_finetuned3,testloader0, n_examples = 6, plt_elipses=True,plt_imgs=True,time=6, feed_origion=True, shadow=True, win=9)
-
+save_examples(IRmodel_finetuned3,testloader0, n_examples = 6, plt_markrs=True,plt_imgs=True,time=6, feed_origion=True, shadow=True, win=9)
 
 
-IRmodel_finetuned
-AM_recurrent_loss(IRmodel_finetuned.eval(),testloader0 , max_iterations=10, No_recurences = 2, key ='Affine_mtrx', plot=False, plot_batach = 0, prefix = 'randomdifficulty')
-
+'''
 
 Measures_list = Intitial_Tx#['angle', 'scaleX','scaleY','translationX','translationY','shearX','shearY', 'reflectionX', 'reflectionY']
 BLOCK_options = {'Full':(0,1), 'Hard70-100%':(0.7,1), 'Medium30-70':(0.3,0.7), 'Easy10-30%':(0.1,0.3), 'Easier5-10%':(0.05,0.1), 'Easiest0-5%':(0,0.05)}
@@ -1829,7 +1908,7 @@ for Difficulty in BLOCK_options.keys():
 print(MSE_AffineMatrix_recurrent_difficulty)
 json.dump(MSE_AffineMatrix_recurrent_difficulty, open( file_savingfolder+'MSE_AffineMatrix_recurrent_difficulty_full_model.txt', 'w' ) )
 
-
+'''
 
 
 
@@ -1855,6 +1934,8 @@ json.dump(MSE_AffineMatrix_recurrent_difficulty, open( file_savingfolder+'MSE_Af
 
 file_loadingfolder = '/home/ahmadh/MIR_savedmodel/Rawblock_Mi0:12Epochs_bidirectional__uniscale_AdjustPlot_avgPool_LR_V.concat__mobileVIT_active_0.1/'
 ext = '_EndTraining'#'_EndTraining' #_bestVal
+
+
 
 FREEZE_stage1 = False
 if 'VIT' in Arch:
@@ -1959,6 +2040,7 @@ IRmodel_finetuned = Build_IRmodel_finetuned_ViT(IR_Model_stage1, IR_Model_stage2
 
 
 
+
 def count_trainable_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -2036,28 +2118,53 @@ print(prof.key_averages().table(sort_by="cpu_memory_usage", row_limit=10))
 
 '''
 
+difficult_first = True
+Learning_rate = 0.001
+optimizer = optim.Adam(IRmodel_finetuned.parameters(), lr=Learning_rate)
 
-Learning_rate = 0.0001
 cyclic_loss_factor = 0.05
+if Curriculum_learning:
+    TOTAL_Epochs = 30
+    if difficult_first:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+else:
+    TOTAL_Epochs=12
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+
 
 print_every = int(2000*80/batch_size)
 MSE_loss = torch.nn.functional.mse_loss
-optimizer = optim.AdamW(IRmodel_finetuned.parameters(), lr=Learning_rate)#, momentum=0.9
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
-
 #def train_IR_model(IR_Model, trainloader, TOTAL_Epochs = 12,):
-training_loss_epochslist = []
-validation_loss_epochslist = []
+#training_loss_epochslist = []
+#validation_loss_epochslist = []
 training_loss_iterationlist = []
 M1_training_loss_iterationlist = []
 global_loss_iterationlist = []
 validation_loss_iterationlist = []
-TOTAL_Epochs = 12
-if Curriculum_learning:
-    TOTAL_Epochs = 45
+
+
+'''
+core_model_stage2.load_state_dict(torch.load(file_savingfolder+'core_model_stage2_EndTraining.pth'))
+core_model_stage1.load_state_dict(torch.load(file_savingfolder+'core_model_stage1_EndTraining.pth'))
+IR_Model_stage2.load_state_dict(torch.load(file_savingfolder+'IR_Model_stage2_EndTraining.pth'))
+IR_Model_stage1.load_state_dict(torch.load(file_savingfolder+'IR_Model_stage1_EndTraining.pth'))
+IRmodel_finetuned.load_state_dict(torch.load(file_savingfolder+'IRmodel_finetuned_EndTraining.pth'))
+
+def read_list(file_path):
+    with open(file_path) as f:
+        x = f.readlines()
+        m_list = [float(num.replace('\n','')) for num in x]
+    return m_list
+
+training_loss_iterationlist = read_list(file_savingfolder+'training_loss_iterationlist.txt')
+validation_loss_iterationlist = read_list(file_savingfolder+'validation_loss_iterationlist.txt')
+M1_training_loss_iterationlist = read_list(file_savingfolder+'M1_training_loss_iterationlist.txt')
+global_loss_iterationlist = read_list(file_savingfolder+'global_loss_iterationlist.txt')
+'''
+
+
 
 best_loss = 100000000000000000000
-
 
 for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
     i=-1
@@ -2067,15 +2174,28 @@ for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
     loss_prnt_cyclic0= 0.0
     loss_prnt_cyclic1= 0.0
     if Curriculum_learning:
-        #Difficulty_factor = min(1, (EPOCH+1)/TOTAL_Epochs)
-        #Difficulty_factor = min(1, np.log(0.5*EPOCH+1)/np.log(0.5*TOTAL_Epochs-7))
-        if EPOCH+7<TOTAL_Epochs:
-            Difficulty_factor= np.log(0.5*EPOCH+1)/np.log(0.5*TOTAL_Epochs)
+        if difficult_first:
+            if EPOCH<20:
+                Difficulty_factor= 1
+            else:
+                Difficulty_factor= 1 - ((EPOCH-21)/(TOTAL_Epochs-20))
+            def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx, block_min =0, block_max= Difficulty_factor): 
+                wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
+                return wrapped_img, Affine_mtrx, Affine_parameters
         else:
-            Difficulty_factor= 1
-        def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx, block_min =0, block_max= Difficulty_factor): 
-            wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
-            return wrapped_img, Affine_mtrx, Affine_parameters
+            Learning_rate = 0.0001 + 0.005*math.sin(math.pi*EPOCH/TOTAL_Epochs)
+            optimizer = torch.optim.AdamW(IRmodel_finetuned.parameters(), lr=Learning_rate)#, momentum=0.9
+            #if EPOCH==TOTAL_Epochs//2:
+                #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+            #Difficulty_factor = min(1, (EPOCH+1)/TOTAL_Epochs)
+            #Difficulty_factor = min(1, np.log(0.5*EPOCH+1)/np.log(0.5*TOTAL_Epochs-7))
+            if EPOCH+5<TOTAL_Epochs:
+                Difficulty_factor= np.log(0.5*EPOCH+1)/np.log(0.5*TOTAL_Epochs)
+            else:
+                Difficulty_factor= 1
+            def augment_img(image0, NOISE_LEVEL=Noise_level_dataset, MODE='bilinear', ONE_MESURE=Intitial_Tx, block_min =0, block_max= Difficulty_factor): 
+                wrapped_img, Affine_mtrx, Affine_parameters = pass_augment_img(image0, measure =ONE_MESURE, MODE=MODE, NOISE_LEVEL=NOISE_LEVEL, block_min =block_min, block_max=block_max)
+                return wrapped_img, Affine_mtrx, Affine_parameters
     if with_Difficultyadj_loss:
         weight_loss = Difficulty_factor
     else:
@@ -2117,7 +2237,10 @@ for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
             if i % print_every == 0:
                 eval_loss_x = test_loss(IRmodel_finetuned, valloader,int(2000/batch_size),'Affine_mtrx').detach().item()
                 if with_scheduler:
-                    scheduler.step(eval_loss_x)
+                    try:
+                        scheduler.step(eval_loss_x)
+                    except:
+                        FreePalestine=1948
                 training_loss_iterationlist.append( threshold(running_loss/print_every))
                 validation_loss_iterationlist.append(threshold(eval_loss_x))
                 printed_text = f'[epoch:{EPOCH}, iter:{i:5d}], training loss: {running_loss/print_every:.3f}, eval loss:{eval_loss_x:.3f}, '                   
@@ -2143,17 +2266,17 @@ for EPOCH in range(0, TOTAL_Epochs):  # loop over the dataset multiple times
     plt.plot(training_loss_iterationlist, label = 'training loss')
     plt.plot(validation_loss_iterationlist, label = 'validation loss')
     if with_global_loss:
-        plt.plot(global_loss_iterationlist, label = 'training loss')
+        #plt.plot(global_loss_iterationlist, label = 'training loss')
         np.savetxt(file_savingfolder+'global_loss_iterationlist.txt', global_loss_iterationlist, delimiter=",", fmt="%.3f")
     if include_loss_model1:
         plt.plot(M1_training_loss_iterationlist, label = 'model1 training loss')
         np.savetxt(file_savingfolder+'M1_training_loss_iterationlist.txt', M1_training_loss_iterationlist, delimiter=",", fmt="%.3f")
+    plt.ylim(0,0.5)
     plt.legend()
     plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
     plt.close()
     np.savetxt(file_savingfolder+'training_loss_iterationlist.txt', training_loss_iterationlist, delimiter=",", fmt="%.3f")
     np.savetxt(file_savingfolder+'validation_loss_iterationlist.txt', validation_loss_iterationlist, delimiter=",", fmt="%.3f")
-    
 
 
 
@@ -2278,6 +2401,7 @@ with open(file_savingfolder+'validation_loss_iterationlist.npy', 'wb') as f:
 
 plt.plot(training_loss_iterationlist, label = 'training loss')
 plt.plot(validation_loss_iterationlist, label = 'validation loss')
+plt.ylim(0, 0.4)
 plt.legend()
 plt.savefig(file_savingfolder+'loss_iterations.png', bbox_inches='tight')
 plt.close()
@@ -2285,7 +2409,7 @@ plt.close()
 
 
 os.system('mkdir '+ file_savingfolder+ 'MIRexamples')
-AM_recurrent_loss(IR_Model_stage2.eval(),testloader0 , max_iterations=100, No_recurences = 7, key ='Affine_mtrx', plot=True, plot_batach = 5, prefix = 'randomdifficulty')
+AM_recurrent_loss(IR_Model_stage2.eval(),testloader0 , max_iterations=100, No_recurences = 4, key ='Affine_mtrx', plot=True, plot_batach = 5, prefix = 'randomdifficulty')
 
 
 def test_loss_i(model, loader, max_iterations=100, key = 'Affine_mtrx'):
@@ -2336,7 +2460,10 @@ def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_ME
     return wrapped_img, Affine_mtrx, Affine_parameters
 
 
-save_examples(IRmodel_finetuned3,testloader0, n_examples = 6, plt_elipses=True,plt_imgs=True,time=6, feed_origion=True, shadow=True, win=9)
+save_examples(IRmodel_finetuned3,testloader0, n_examples = 6, plt_markrs=True,plt_imgs=True,time=6, feed_origion=True, shadow=True, win=9)
+
+
+
 
 
 
@@ -2661,7 +2788,7 @@ MSE_affine = test_loss(IR_Model_tst, testloader0,100, key = 'Affine_mtrx').detac
 print(MSE_affine)
 json.dump( MSE_affine, open( file_savingfolder+'Test_loss_noNoise_sigma0.txt', 'w' ) )
 
-save_examples(IR_Model_tst,testloader0, n_examples = 6, plt_elipses=True,plt_imgs=True,time=6, feed_origion=True, shadow=True, win=9)
+save_examples(IR_Model_tst,testloader0, n_examples = 6, plt_markrs=True,plt_imgs=True,time=6, feed_origion=True, shadow=True, win=9)
 
 
 #----------------------------------------------------------
@@ -2676,7 +2803,7 @@ def augment_img(image0, NOISE_LEVEL=Noise_level_testset, MODE='bilinear', ONE_ME
     return wrapped_img, Affine_mtrx, Affine_parameters
 
 test_loss(IR_Model_tst,testloader0,100, key = 'Affine_mtrx').detach().item()
-save_examples(IR_Model,testloader0, n_examples = 6, plt_elipses=True,plt_imgs=True,time=4, feed_origion=True)
+save_examples(IR_Model,testloader0, n_examples = 6, plt_markrs=True,plt_imgs=True,time=4, feed_origion=True)
 '''
 
 ##------------------------------------------------------------------
@@ -2868,7 +2995,7 @@ json.dump( Marker_measures, open( file_savingfolder+'Marker_measures.txt', 'w' )
 ## Recurrent estimation of the Affine matrix
 ##------------------------------------------------------------------
 '''
-def plot_examples(source,target,wrapped_img,AM_Predicted=0,AM_GroundTruth=0, n_examples = 4, iteration = 0, prefix= 'randomdifficulty' ,plt_elipses=False,plt_imgs=True, shadow=True):
+def plot_examples(source,target,wrapped_img,AM_Predicted=0,AM_GroundTruth=0, n_examples = 4, iteration = 0, prefix= 'randomdifficulty' ,plt_markrs=False,plt_imgs=True, shadow=True):
     #prepare figures
     if shadow:
         plots_per_example = 4
@@ -2883,7 +3010,7 @@ def plot_examples(source,target,wrapped_img,AM_Predicted=0,AM_GroundTruth=0, n_e
         if shadow:
             Error_map = torch.abs(target.detach()-wrapped_img.detach())
         for k in range(n_examples):
-            if plt_elipses:
+            if plt_markrs:
                 M_GroundTruth = workaround_matrix(AM_GroundTruth.detach(), acc = 0.5/crop_ratio)
                 M_Predicted = workaround_matrix(AM_Predicted.detach(), acc = 0.5/crop_ratio)
                 x0_source, y0_source = generate_standard_mark()
@@ -2912,7 +3039,7 @@ def plot_examples(source,target,wrapped_img,AM_Predicted=0,AM_GroundTruth=0, n_e
             ax.axes.get_xaxis().set_visible(False)
             ax.axes.get_yaxis().set_visible(False)
     suffix = ''
-    if plt_elipses:
+    if plt_markrs:
             suffix += 'Elipse'
     if plt_imgs:
         suffix += 'Img'
@@ -2972,7 +3099,7 @@ def AM_recurrent_loss(model,loader , max_iterations=100, No_recurences = 3, key 
 
 '''
 
-def plot_examples(source,target,wrapped_img,AM_Predicted=0,AM_Previous=0, AM_GroundTruth=0, n_examples = 4, iteration = 0, prefix= 'randomdifficulty' ,plt_elipses=True,plt_imgs=True, shadow=True):
+def plot_examples(source,target,wrapped_img,AM_Predicted=0,AM_Previous=0, AM_GroundTruth=0, n_examples = 4, iteration = 0, prefix= 'randomdifficulty' ,plt_markrs=True,plt_imgs=True, shadow=True):
     #prepare figures
     if shadow:
         plots_per_example = 4
@@ -2987,7 +3114,7 @@ def plot_examples(source,target,wrapped_img,AM_Predicted=0,AM_Previous=0, AM_Gro
         if shadow:
             Error_map = torch.abs(target.detach()-wrapped_img.detach())
         for k in range(n_examples):
-            if plt_elipses:
+            if plt_markrs:
                 M_GroundTruth = workaround_matrix(AM_GroundTruth.detach(), acc = 0.5/crop_ratio)
                 M_Predicted = workaround_matrix(AM_Predicted.detach(), acc = 0.5/crop_ratio)
                 M_Previous = workaround_matrix(AM_Previous.detach(), acc = 0.5/crop_ratio)
@@ -3021,7 +3148,7 @@ def plot_examples(source,target,wrapped_img,AM_Predicted=0,AM_Previous=0, AM_Gro
             ax.axes.get_xaxis().set_visible(False)
             ax.axes.get_yaxis().set_visible(False)
     suffix = ''
-    if plt_elipses:
+    if plt_markrs:
             suffix += 'Elipse'
     if plt_imgs:
         suffix += 'Img'
@@ -3055,7 +3182,7 @@ source_origion_224j = torch.nn.functional.grid_sample(source_origion, grid=grd,
 wrapped_img = torchvision.transforms.CenterCrop((dim, dim))(source_origion_224j)
 
 plot_examples(source0,target,wrapped_img,AM_Predicted=Affine_mtrx_j,AM_Previous=Accumilative_Affine_matrix, AM_GroundTruth=labels['Affine_mtrx'],
-                n_examples = 4, iteration = 0, prefix= '2dbug' ,plt_elipses=True,plt_imgs=True, shadow=True)
+                n_examples = 4, iteration = 0, prefix= '2dbug' ,plt_markrs=True,plt_imgs=True, shadow=True)
 
 
 def AM_recurrent_loss(model,loader , max_iterations=2, No_recurences = 3, key ='Affine_mtrx', plot=True, plot_batach = 1, prefix = 'debug'):
@@ -3088,7 +3215,7 @@ def AM_recurrent_loss(model,loader , max_iterations=2, No_recurences = 3, key ='
                 wrapped_img = torchvision.transforms.CenterCrop((dim, dim))(source_origion_224j)
                 if plot:
                     if i== plot_batach:
-                        plot_examples(source0,target,wrapped_img, AM_Predicted=Affine_mtrx_j,AM_Previous=Accumilative_Affine_matrix, AM_GroundTruth=labels[key], n_examples = 4, iteration = 0, plt_elipses=True, prefix= prefix)
+                        plot_examples(source0,target,wrapped_img, AM_Predicted=Affine_mtrx_j,AM_Previous=Accumilative_Affine_matrix, AM_GroundTruth=labels[key], n_examples = 4, iteration = 0, plt_markrs=True, prefix= prefix)
                 for j in range(1, No_recurences):
                     inputs_j ={'source': wrapped_img,
                                 'target': target,
@@ -3104,7 +3231,7 @@ def AM_recurrent_loss(model,loader , max_iterations=2, No_recurences = 3, key ='
                     wrapped_img = torchvision.transforms.CenterCrop((dim, dim))(source_origion_224j)
                     if plot:
                         if i== plot_batach:
-                            plot_examples(inputs_j['source'],target,wrapped_img,AM_Predicted=Affine_mtrx_j, AM_Previous=Accumilative_Affine_matrix, AM_GroundTruth=labels[key], n_examples = 4, iteration = j, plt_elipses=True, prefix= prefix)
+                            plot_examples(inputs_j['source'],target,wrapped_img,AM_Predicted=Affine_mtrx_j, AM_Previous=Accumilative_Affine_matrix, AM_GroundTruth=labels[key], n_examples = 4, iteration = j, plt_markrs=True, prefix= prefix)
                     AM_MSE_tot[str(j)] += MSE_loss(labels[key].detach(), New_Accumilative_Affine_matrix.detach()).item()
             else:
                 for r in range(No_recurences):
@@ -3151,7 +3278,7 @@ def AM_recurrent_loss(model,loader , max_iterations=2, No_recurences = 3, key ='
                         wrapped_img_plt = torchvision.transforms.ToPILImage()(wrapped_img[0])
                         wrapped_img_plt.save(file_savingfolder+'MIRexamples/0_debug_warped{}_iteration{}.jpeg'.format(i, j))
                         #'''
-                        plot_examples(source0,target,wrapped_img, AM_Predicted=Affine_mtrx_j,AM_Previous=Accumilative_Affine_matrix, AM_GroundTruth=labels[key], n_examples = 4, iteration = 0, plt_elipses=True, prefix= prefix)
+                        plot_examples(source0,target,wrapped_img, AM_Predicted=Affine_mtrx_j,AM_Previous=Accumilative_Affine_matrix, AM_GroundTruth=labels[key], n_examples = 4, iteration = 0, plt_markrs=True, prefix= prefix)
                 for j in range(1, No_recurences):
                     inputs_j ={'source': wrapped_img,
                                 'source_origion': source_origion,
@@ -3175,7 +3302,7 @@ def AM_recurrent_loss(model,loader , max_iterations=2, No_recurences = 3, key ='
                     wrapped_img = wrapped_img_acc.detach()
                     if plot:
                         if i== plot_batach:
-                            plot_examples(inputs_j['source'],target,wrapped_img,AM_Predicted=Affine_mtrx_j, AM_Previous=Accumilative_Affine_matrix, AM_GroundTruth=labels[key], n_examples = 4, iteration = j, plt_elipses=True, prefix= prefix)
+                            plot_examples(inputs_j['source'],target,wrapped_img,AM_Predicted=Affine_mtrx_j, AM_Previous=Accumilative_Affine_matrix, AM_GroundTruth=labels[key], n_examples = 4, iteration = j, plt_markrs=True, prefix= prefix)
                             '''#debug:
                             wrapped_img_plt = torchvision.transforms.ToPILImage()(wrapped_img[0])
                             wrapped_img_plt.save(file_savingfolder+'MIRexamples/0_debug_warped{}_iteration{}.jpeg'.format(i, j))
@@ -3356,7 +3483,7 @@ print('Recurrent PXL_NCC_avg when sigma=0.0:', Pixels_NCC_AffineMatrix_difficult
 json.dump( Pixels_MSE_AffineMatrix_difficulty, open( file_savingfolder+'Recurrent_PXL_MSE_difficulties.txt', 'w' ) )
 json.dump( Pixels_NCC_AffineMatrix_difficulty, open( file_savingfolder+'Recurrent_PXL_NCC_difficulties.txt', 'w' ) )
 
-save_examples(IR_Model_tst,testloader0, n_examples = 6, plt_elipses=True,plt_imgs=True,time=6, feed_origion=True, shadow=True, win=5)
+save_examples(IR_Model_tst,testloader0, n_examples = 6, plt_markrs=True,plt_imgs=True,time=6, feed_origion=True, shadow=True, win=5)
 
 
 
